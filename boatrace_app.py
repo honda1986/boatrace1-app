@@ -547,6 +547,71 @@ def predict_scenario(scores: dict, before_info: dict, detail: dict) -> dict:
     return scenario
 
 
+def fetch_race_result(jcd: str, date_str: str, rno: int) -> dict:
+    """レース結果ページから着順と払戻金を取得"""
+    result = {"order": [], "trifecta_payout": 0, "trio_payout": 0}
+    try:
+        url = f"{BOATRACE_URL}/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={date_str}"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 着順テーブル
+        result_tables = soup.find_all("table", class_=re.compile(r"is-w495|is-w238"))
+        for tbl in soup.find_all("table"):
+            rows = tbl.find_all("tr")
+            for row in rows:
+                cells = row.find_all("td")
+                texts = [c.get_text(strip=True) for c in cells]
+                # 着順行: "1" "1号艇" "選手名" ...
+                if texts and re.match(r"^[1-6]$", texts[0]):
+                    rank = int(texts[0])
+                    # 枠番を探す
+                    for t in texts[1:]:
+                        bm = re.match(r"^(\d)$", t)
+                        if bm and 1 <= int(bm.group(1)) <= 6:
+                            if len(result["order"]) == rank - 1:
+                                result["order"].append(int(bm.group(1)))
+                            break
+
+        # 着順が取れなかった場合の別パース
+        if len(result["order"]) < 3:
+            result["order"] = []
+            for tbl in soup.find_all("table"):
+                caption = tbl.find("caption") or tbl.find_previous("h3")
+                tbl_text = (caption.get_text(strip=True) if caption else "") + tbl.get_text(" ", strip=True)
+                if "着順" in tbl_text or "成績" in tbl_text:
+                    for row in tbl.find_all("tr"):
+                        cells = row.find_all("td")
+                        if not cells:
+                            continue
+                        texts = [c.get_text(strip=True) for c in cells]
+                        # 枠番色のクラスから判定
+                        for cell in cells:
+                            boat_span = cell.find("span", class_=re.compile(r"is-boatColor"))
+                            if boat_span:
+                                bn = re.search(r"(\d)", boat_span.get_text(strip=True))
+                                if bn:
+                                    boat = int(bn.group(1))
+                                    if boat not in result["order"]:
+                                        result["order"].append(boat)
+
+        # 払戻金
+        full_text = soup.get_text(" ", strip=True)
+        # 3連単
+        tri_match = re.search(r"3連単[^\d]*?([\d,]+)円", full_text)
+        if tri_match:
+            result["trifecta_payout"] = int(tri_match.group(1).replace(",", ""))
+        # 3連複
+        trio_match = re.search(r"3連複[^\d]*?([\d,]+)円", full_text)
+        if trio_match:
+            result["trio_payout"] = int(trio_match.group(1).replace(",", ""))
+
+    except Exception:
+        pass
+    return result
+
+
 # ──────────────── データ取得関数 ────────────────
 def get_venues(date_str: str) -> list[dict]:
     url = f"{BASE_URL}/raceindex.php?date={date_str}"
@@ -770,6 +835,15 @@ if run:
 
     st.markdown("---")
 
+    # 過去日判定
+    is_past = selected_date < date.today()
+
+    # 回収率集計用
+    total_bet_cost = 0
+    total_payout = 0
+    hit_count = 0
+    result_count = 0
+
     # ── 各レース詳細カード + スコアリング ──
     for race in hit_list:
         wr = race["win_rates"]
@@ -841,7 +915,7 @@ if run:
                 <span class="boat-badge" style="background:{bg};color:{tc};font-size:12px;">{b}</span>
                 <span style="width:80px;font-size:13px;">{name}</span>
                 <div style="flex:1;background:#16213e;border-radius:4px;height:20px;margin:0 8px;">
-                    <div style="width:{bar_w}%;background:{'#e94560' if b == 1 else '#0f3460'};height:20px;border-radius:4px;"></div>
+                    <div style="width:{bar_w}%;background:{'#e94560' if b == 1 else '#2a6496'};height:20px;border-radius:4px;"></div>
                 </div>
                 <span style="font-weight:bold;font-size:14px;width:50px;text-align:right;color:{'#e94560' if s['total'] >= 15 else '#eee'};">
                     {s['total']:.1f}
@@ -885,4 +959,85 @@ if run:
                 </div>
             </div>
         </div>
-        """, height=340)
+        """, height=380)
+
+        # ── 過去レースの結果表示 ──
+        if is_past:
+            with st.spinner(f"{race['venue']} {race['race_no']}R 結果取得中..."):
+                race_result = fetch_race_result(jcd_for_race, date_str, race["race_no"])
+                _time.sleep(0.2)
+
+            order = race_result.get("order", [])
+            tri_pay = race_result.get("trifecta_payout", 0)
+
+            if len(order) >= 3:
+                result_count += 1
+                # 的中判定
+                actual_top3 = tuple(order[:3])
+                bet_hit = actual_top3 in [(a, b2, c) for a, b2, c in bets[:6]]
+                bet_cost = len(bets[:6]) * 100  # 各100円
+                total_bet_cost += bet_cost
+
+                if bet_hit:
+                    hit_count += 1
+                    total_payout += tri_pay
+
+                # 着順表示
+                order_badges = ""
+                for rank_i, ob in enumerate(order[:6], 1):
+                    obg = BOAT_BG_COLORS.get(ob, "#555")
+                    otc = BOAT_TEXT_COLORS.get(ob, "#fff")
+                    oname = race["names"].get(ob, detail_info.get("names", {}).get(ob, "---"))
+                    order_badges += f"""
+                    <div style="display:flex;align-items:center;margin:2px 0;">
+                        <span style="width:30px;color:#888;font-size:13px;">{rank_i}着</span>
+                        <span class="boat-badge" style="background:{obg};color:{otc};width:24px;height:24px;line-height:24px;font-size:12px;">{ob}</span>
+                        <span style="font-size:13px;margin-left:4px;">{oname}</span>
+                    </div>"""
+
+                hit_label = '<span style="color:#FDD835;font-weight:bold;font-size:16px;">🎉 的中！</span>' if bet_hit else '<span style="color:#888;">✗ 不的中</span>'
+                pay_text = f"3連単 {tri_pay:,}円" if tri_pay else "払戻情報なし"
+
+                render_html(f"""
+                <div style="background:#1a1a2e;border-radius:8px;padding:12px;margin:0;border-left:4px solid {'#FDD835' if bet_hit else '#555'};">
+                    <div style="font-weight:bold;margin-bottom:8px;color:#4fc3f7;">🏁 レース結果</div>
+                    {order_badges}
+                    <div style="margin-top:8px;padding-top:8px;border-top:1px solid #333;">
+                        {hit_label}
+                        <span style="margin-left:12px;color:#aaa;font-size:13px;">{pay_text}</span>
+                    </div>
+                </div>
+                """, height=280)
+
+    # ── 全体回収率サマリー ──
+    if is_past and result_count > 0:
+        st.markdown("---")
+        roi = (total_payout / total_bet_cost * 100) if total_bet_cost > 0 else 0
+        roi_color = "#FDD835" if roi >= 100 else "#e94560"
+        render_html(f"""
+        <div style="background:#1a1a2e;border-radius:12px;padding:16px;border:2px solid {roi_color};">
+            <div style="font-weight:bold;font-size:16px;margin-bottom:12px;color:{roi_color};">📈 本日の回収率サマリー</div>
+            <div style="display:flex;justify-content:space-around;text-align:center;">
+                <div>
+                    <div style="color:#888;font-size:12px;">対象レース</div>
+                    <div style="color:#fff;font-size:20px;font-weight:bold;">{result_count}</div>
+                </div>
+                <div>
+                    <div style="color:#888;font-size:12px;">的中</div>
+                    <div style="color:#FDD835;font-size:20px;font-weight:bold;">{hit_count}</div>
+                </div>
+                <div>
+                    <div style="color:#888;font-size:12px;">投資</div>
+                    <div style="color:#fff;font-size:20px;font-weight:bold;">{total_bet_cost:,}円</div>
+                </div>
+                <div>
+                    <div style="color:#888;font-size:12px;">回収</div>
+                    <div style="color:#fff;font-size:20px;font-weight:bold;">{total_payout:,}円</div>
+                </div>
+                <div>
+                    <div style="color:#888;font-size:12px;">回収率</div>
+                    <div style="color:{roi_color};font-size:20px;font-weight:bold;">{roi:.1f}%</div>
+                </div>
+            </div>
+        </div>
+        """, height=130)
