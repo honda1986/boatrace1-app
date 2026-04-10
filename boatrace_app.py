@@ -61,7 +61,7 @@ BOAT_TEXT_COLORS = {
 }
 
 # ──────────────── スコアリング定数 ────────────────
-COURSE_BASE = {1: 10, 2: 6, 3: 5, 4: 4, 5: 3, 6: 1}
+COURSE_BASE = {1: 7, 2: 5, 3: 4, 4: 3.5, 5: 3, 6: 1.5}
 IN_BOOST_VENUES = {"18", "24", "19"}   # 徳山/大村/下関
 IN_PENALTY_VENUES = {"02", "04", "03"} # 戸田/平和島/江戸川
 HARD_WATER_VENUES = {"02", "03", "04", "10", "11"} # 難水面
@@ -184,6 +184,8 @@ def fetch_racelist_detail(jcd: str, date_str: str, rno: int) -> dict:
         "avg_st": {},          # {boat: float}
         "f_count": {},         # {boat: int}
         "names": {},
+        "player_class": {},    # {boat: str} A1/A2/B1/B2
+        "player_age": {},      # {boat: int}
         "is_first_day": False,
         "is_final": False,
         "session_results": {},  # {boat: [着順list]}
@@ -217,6 +219,19 @@ def fetch_racelist_detail(jcd: str, date_str: str, rno: int) -> dict:
                 name_cell = row.find("a", href=re.compile(r"toJinData"))
                 if name_cell:
                     detail["names"][boat_no] = name_cell.get_text(strip=True)
+
+                # クラス (A1/A2/B1/B2)
+                for t in texts:
+                    if re.match(r"^[AB][12]$", t) and boat_no not in detail["player_class"]:
+                        detail["player_class"][boat_no] = t
+
+                # 年齢
+                for t in texts:
+                    am = re.match(r"^(\d{2})歳?$", t)
+                    if am and boat_no not in detail["player_age"]:
+                        age = int(am.group(1))
+                        if 15 <= age <= 75:
+                            detail["player_age"][boat_no] = age
 
                 # 全国勝率/2連率
                 for ci, t in enumerate(texts):
@@ -257,8 +272,8 @@ def fetch_racelist_detail(jcd: str, date_str: str, rno: int) -> dict:
 
 def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> dict:
     """
-    10項目スコアリング。race_data は既存の parse_racelist 結果。
-    Returns {boat: {total, items: {①〜⑩: val}}}
+    v2 12項目スコアリング。
+    Returns {boat: {total, items: {①〜⑫: val}}}
     """
     scores = {}
     boats = range(1, 7)
@@ -285,9 +300,9 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
         venue_adj = 0
         if b == 1:
             if jcd in IN_BOOST_VENUES:
-                venue_adj = 3
+                venue_adj = 2.5
             elif jcd in IN_PENALTY_VENUES:
-                venue_adj = -3
+                venue_adj = -2.5
         items["②場別補正"] = venue_adj
 
         # ③ 風速・波高補正
@@ -319,7 +334,6 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
                 motor_adj = 1.5
             elif m2 < 25:
                 motor_adj = -2.0
-        # 初日は0.5倍に減衰
         if detail.get("is_first_day"):
             motor_adj *= 0.5
         items["④モーター"] = motor_adj
@@ -334,31 +348,24 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
                 et_adj = -2.0
         items["⑤展示タイム"] = et_adj
 
-        # ⑥ 平均ST（⑥-2 節間ST補正を優先）
+        # ⑥ 平均ST（節間ST優先）
         st_adj = 0
         sess_st = detail.get("session_st", {}).get(b, [])
         avg_st_val = before_info.get("avg_st", {}).get(b)
-        nat_rate = detail.get("national_rate", {}).get(b)
-
         has_session_st = len(sess_st) >= 2
         if has_session_st:
-            # ⑥-2 節間ST補正
             sess_avg = sum(sess_st) / len(sess_st)
-            # 全国平均STの代理: avg_st (出走表の平均ST)
             ref_st = avg_st_val if avg_st_val else 0.15
             if sess_avg < ref_st - 0.05:
                 st_adj += 1.5
             elif sess_avg > ref_st + 0.05:
                 st_adj -= 1.5
-            # 安定性: 3走連続0.15以内
             if len(sess_st) >= 3 and all(s <= 0.15 for s in sess_st[-3:]):
                 st_adj += 1.0
-            # 不安定: 直近0.20以上が2回
             recent_slow = sum(1 for s in sess_st[-3:] if s >= 0.20)
             if recent_slow >= 2:
                 st_adj -= 1.0
         else:
-            # 通常の⑥
             if avg_st_val is not None:
                 if avg_st_val <= 0.10:
                     st_adj = 2.0
@@ -372,35 +379,36 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
         if fc >= 2:
             f_adj = -3.0
         elif fc == 1:
-            # ダッシュ/スロー判定 (簡略: コース4-6はダッシュ)
             if b >= 4:
-                f_adj = -2.0
+                f_adj = -2.0  # ダッシュ
             else:
-                f_adj = -1.0
-        # F持ち選手の⑦半減条件 (節間STが平均ST同等)
+                f_adj = -1.0  # スロー
+        # F持ち＋節間STが平均ST同等 → ⑦半減
         if fc >= 1 and has_session_st and avg_st_val:
             sess_avg = sum(sess_st) / len(sess_st)
             if abs(sess_avg - avg_st_val) < 0.02:
                 f_adj *= 0.5
         items["⑦Fペナ"] = f_adj
 
-        # ⑧ 選手力
+        # ⑧ 選手力（勝率ベース）
         player_adj = 0
         wr = race_data.get("win_rates", {}).get(b) or detail.get("national_rate", {}).get(b)
         if wr is not None:
-            if wr >= 7.5:
+            if wr >= 8.00:
+                player_adj = 3.5
+            elif wr >= 7.50:
                 player_adj = 3.0
-            elif wr >= 6.5:
+            elif wr >= 7.00:
                 player_adj = 2.0
-            elif wr >= 5.5:
+            elif wr >= 6.00:
                 player_adj = 1.0
-            elif wr >= 4.5:
+            elif wr >= 5.00:
                 player_adj = 0.0
-            elif wr >= 3.5:
+            elif wr >= 4.00:
                 player_adj = -1.0
             else:
                 player_adj = -2.0
-        # 難水面当地補正
+        # 難水面当地補正 ±1.0
         local_wr = detail.get("local_rate", {}).get(b)
         if jcd in HARD_WATER_VENUES:
             if local_wr and local_wr > 5.0:
@@ -409,34 +417,25 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
                 player_adj -= 1.0
         items["⑧選手力"] = player_adj
 
-        # ⑨ 節間動態 (⑨-2 強化版)
+        # ⑨ 節間順位動態（強化版）
         sess_adj = 0
         sess_res = detail.get("session_results", {}).get(b, [])
         if len(sess_res) >= 3:
-            # 3走連続改善
             last3 = sess_res[-3:]
             if last3[0] > last3[1] > last3[2]:
                 sess_adj += 1.5
-            # 3走連続悪化
-            if last3[0] < last3[1] < last3[2]:
-                sess_adj -= 1.5
-            # 3走連続着外
             if all(r >= 4 for r in last3):
                 sess_adj -= 2.0
         if len(sess_res) >= 2:
             last2 = sess_res[-2:]
-            # 直近2走連続1着
             if all(r == 1 for r in last2):
                 sess_adj += 2.0
-            # 直近2走連続2着以内
             elif all(r <= 2 for r in last2):
                 sess_adj += 1.0
         if len(sess_res) >= 1:
-            # 直近1走6着＋展示タイム下位
             if sess_res[-1] == 6:
                 if bt_et is not None and et_worst is not None and bt_et >= et_worst:
                     sess_adj -= 1.5
-        # 今節2連率 vs 全国2連率
         if sess_res:
             sess_2rate = sum(1 for r in sess_res if r <= 2) / len(sess_res) * 100
             nat_2r = detail.get("national_2rate", {}).get(b, 40)
@@ -446,9 +445,43 @@ def calc_scores(race_data: dict, before_info: dict, detail: dict, jcd: str) -> d
                 sess_adj -= 1.0
         items["⑨節間動態"] = sess_adj
 
-        # ⑩ 進入変動 (簡易: データ不足時は0)
+        # ⑩ 進入変動
         entry_adj = 0
         items["⑩進入変動"] = entry_adj
+
+        # ⑪ 選手クラス補正
+        cls = detail.get("player_class", {}).get(b, "")
+        cls_adj = 0
+        if cls == "A1":
+            cls_adj = 2.5
+        elif cls == "A2":
+            cls_adj = 1.0
+        elif cls == "B1":
+            cls_adj = 0
+        elif cls == "B2":
+            cls_adj = -2.0
+        items["⑪クラス"] = cls_adj
+
+        # ⑫ 選手年齢補正
+        age = detail.get("player_age", {}).get(b, 0)
+        age_adj = 0
+        if 25 <= age <= 35:
+            age_adj = 1.0
+        elif 36 <= age <= 44:
+            age_adj = 0.5
+        elif 45 <= age <= 50:
+            age_adj = 0
+        elif age >= 51:
+            age_adj = -0.5
+        elif 0 < age <= 24:
+            age_adj = -0.5
+        # A1で50歳以上は年齢減算を0に上方修正
+        if cls == "A1" and age >= 50 and age_adj < 0:
+            age_adj = 0
+        # A2以上+51歳以上+当地勝率高い → 年齢減算0
+        if cls in ("A1", "A2") and age >= 51 and local_wr and local_wr >= 5.0:
+            age_adj = 0
+        items["⑫年齢"] = age_adj
 
         total = sum(items.values())
         scores[b] = {"total": round(total, 1), "items": items}
@@ -971,15 +1004,17 @@ if run:
         cands_2 = scenario.get("candidates_2nd", [])
         cands_3 = scenario.get("candidates_3rd", [])
 
-        # スコア差判定
+        # スコア差判定 (v2: 4pt/2pt/1pt)
         s_vals = sorted([scores[b]["total"] for b in range(1, 7)], reverse=True)
         gap = s_vals[0] - s_vals[1] if len(s_vals) >= 2 else 0
-        if gap >= 3:
+        if gap >= 4:
             conf = "◎ 明確な実力差"
-        elif gap >= 1:
+        elif gap > 2:
             conf = "○ やや優位"
+        elif gap > 1:
+            conf = "△ 混戦（穴目検討）"
         else:
-            conf = "△ 混戦"
+            conf = "✗ 完全混戦（見送りorBOX）"
 
         render_html(f"""
         <div style="background:#0f3460;border-radius:8px;padding:12px;margin:0;">
