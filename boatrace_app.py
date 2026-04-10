@@ -523,55 +523,52 @@ def predict_scenario(scores: dict, before_info: dict, detail: dict) -> dict:
 
     scenario["pattern"] = pattern
 
-    # 2着予測
+    # 2着予測 — コース傾向ボーナスをスコアに加算してランキング
     sorted_others = sorted(
         [(b, scores[b]["total"]) for b in range(2, 7)],
         key=lambda x: x[1], reverse=True
     )
 
+    # コース傾向ボーナス（2着になりやすいコースに加点）
+    course_bonus_2nd = {}
     if pattern == "逃げ":
-        # 2C 34.3%, 3C 27.1%
-        candidates_2nd = [2, 3, sorted_others[0][0]]
+        # 逃げ → 2C 34.3%, 3C 27.1%
+        course_bonus_2nd = {2: 2.0, 3: 1.5}
     elif pattern == "差し":
-        # 差し決着 → 1号艇2着率60% → 差した艇が1着にならないので1着固定なら2着は差し艇隣
-        candidates_2nd = [2, 3, sorted_others[0][0]]
+        # 差し → 内側が有利
+        course_bonus_2nd = {2: 2.0, 3: 1.5}
     elif pattern == "まくり":
-        # まくり艇の1つ外側
         makuri_boat = fast_starters[0] if fast_starters else 4
         outer = min(makuri_boat + 1, 6)
-        candidates_2nd = [makuri_boat, outer, sorted_others[0][0]]
+        course_bonus_2nd = {makuri_boat: 2.0, outer: 1.5}
     elif pattern == "まくり差し":
-        candidates_2nd = [2, 3, sorted_others[0][0]]
-    else:
-        candidates_2nd = [sorted_others[0][0], sorted_others[1][0]]
+        course_bonus_2nd = {2: 1.5, 3: 1.5}
 
-    # 重複除去・1を除去
-    seen = set()
-    unique_2nd = []
-    for c in candidates_2nd:
-        if c != 1 and c not in seen:
-            seen.add(c)
-            unique_2nd.append(c)
-    if not unique_2nd:
-        unique_2nd = [sorted_others[0][0]]
+    # スコア＋コースボーナスで2着候補をランキング
+    second_ranking = []
+    for b in range(2, 7):
+        adj_score = scores[b]["total"] + course_bonus_2nd.get(b, 0)
+        second_ranking.append((b, adj_score))
+    second_ranking.sort(key=lambda x: x[1], reverse=True)
 
-    scenario["candidates_2nd"] = unique_2nd[:3]
+    candidates_2nd = [b for b, _ in second_ranking[:3]]
 
-    # 3着: スコア上位から
-    all_used = {1} | set(unique_2nd[:2])
+    scenario["candidates_2nd"] = candidates_2nd
+
+    # 3着: スコア上位から（2着候補を除外）
+    all_used = {1} | set(candidates_2nd[:2])
+    sorted_others = sorted(
+        [(b, scores[b]["total"]) for b in range(2, 7)],
+        key=lambda x: x[1], reverse=True
+    )
     candidates_3rd = [b for b, _ in sorted_others if b not in all_used][:3]
-    # 2着候補の残りも3着候補に
-    for c in unique_2nd:
-        if c not in all_used and c not in candidates_3rd:
-            candidates_3rd.append(c)
 
     scenario["candidates_3rd"] = candidates_3rd[:4]
 
     # 三連単買い目生成 (1着=1号艇固定)
     bets = []
-    for sec in unique_2nd[:3]:
+    for sec in candidates_2nd[:3]:
         thirds = [b for b in range(2, 7) if b != sec]
-        # スコア順でソート
         thirds.sort(key=lambda b: scores[b]["total"], reverse=True)
         for trd in thirds[:2]:
             bets.append((1, sec, trd))
