@@ -1,6 +1,9 @@
 """
 ボートレース 全国勝率フィルター (Streamlit版)
 
+条件: 全国勝率が 1号艇 > 2号艇 の順で、両方とも上位3位以内のレースを抽出
+過去日付の場合: レース結果 + 三連単 1-2-全通り購入時の回収率を表示
+
 使い方:
   pip install streamlit requests beautifulsoup4
   streamlit run boatrace_app.py
@@ -33,35 +36,12 @@ HEADERS = {
                   "Chrome/124.0.0.0 Safari/537.36",
 }
 
-# 枠番の色
-BOAT_COLORS = {
-    1: "#FFFFFF",  # 白
-    2: "#000000",  # 黒
-    3: "#E53935",  # 赤
-    4: "#1E88E5",  # 青
-    5: "#FDD835",  # 黄
-    6: "#43A047",  # 緑
-}
-BOAT_BG_COLORS = {
-    1: "#FFFFFF",
-    2: "#333333",
-    3: "#E53935",
-    4: "#1E88E5",
-    5: "#FDD835",
-    6: "#43A047",
-}
-BOAT_TEXT_COLORS = {
-    1: "#000000",
-    2: "#FFFFFF",
-    3: "#FFFFFF",
-    4: "#FFFFFF",
-    5: "#000000",
-    6: "#FFFFFF",
-}
+BOAT_BG = {1:"#FFFFFF",2:"#333333",3:"#E53935",4:"#1E88E5",5:"#FDD835",6:"#43A047"}
+BOAT_TX = {1:"#000000",2:"#FFFFFF",3:"#FFFFFF",4:"#FFFFFF",5:"#000000",6:"#FFFFFF"}
 
 
-# ──────────────── データ取得関数 ────────────────
-def get_venues(date_str: str) -> list[dict]:
+# ──────────────── データ取得 ────────────────
+def get_venues(date_str):
     url = f"{BASE_URL}/raceindex.php?date={date_str}"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.encoding = "utf-8"
@@ -80,7 +60,7 @@ def get_venues(date_str: str) -> list[dict]:
     return venues
 
 
-def fetch_race_times(jcd: str, date_str: str) -> dict[int, str]:
+def fetch_race_times(jcd, date_str):
     race_times = {}
     try:
         url = f"{BOATRACE_URL}/owpc/pc/race/raceindex?jcd={jcd}&hd={date_str}"
@@ -105,17 +85,6 @@ def fetch_race_times(jcd: str, date_str: str) -> dict[int, str]:
             full = soup.get_text(" ", strip=True)
             for m in re.finditer(r"(\d{1,2})\s*R\s+(\d{1,2}:\d{2})", full):
                 race_times[int(m.group(1))] = m.group(2)
-        if not race_times:
-            tds = soup.find_all("td")
-            for i, td in enumerate(tds):
-                txt = td.get_text(strip=True)
-                rm = re.match(r"^(\d{1,2})R$", txt)
-                if rm and i + 1 < len(tds):
-                    rno = int(rm.group(1))
-                    next_txt = tds[i + 1].get_text(strip=True)
-                    tm = re.search(r"(\d{1,2}:\d{2})", next_txt)
-                    if tm:
-                        race_times[rno] = tm.group(1)
     except Exception:
         pass
     return race_times
@@ -128,8 +97,8 @@ def parse_racelist(jcode, date_str, venue_name, race_times):
     soup = BeautifulSoup(resp.text, "html.parser")
     results = []
     for h3 in soup.find_all("h3"):
-        race_label = h3.get_text(strip=True)
-        m = re.search(r"(\d{1,2})R", race_label)
+        text = h3.get_text(strip=True)
+        m = re.search(r"(\d{1,2})R", text)
         if not m:
             continue
         race_no = int(m.group(1))
@@ -143,30 +112,98 @@ def parse_racelist(jcode, date_str, venue_name, race_times):
             texts = [c.get_text(strip=True) for c in cells]
             if "氏名" in texts:
                 idx = texts.index("氏名")
-                for i, n in enumerate(texts[idx + 1: idx + 7]):
+                for i, n in enumerate(texts[idx+1:idx+7]):
                     if n:
-                        names[i + 1] = n
+                        names[i+1] = n
             if "全国" in texts:
                 in_zenkoku = True
             if "当地" in texts:
                 in_zenkoku = False
             if in_zenkoku and "勝率" in texts and not win_rates:
                 idx = texts.index("勝率")
-                vals = texts[idx + 1: idx + 7]
+                vals = texts[idx+1:idx+7]
                 if len(vals) == 6:
                     try:
-                        win_rates = {i + 1: float(vals[i]) for i in range(6)}
+                        win_rates = {i+1: float(vals[i]) for i in range(6)}
                     except ValueError:
                         pass
         if win_rates:
             results.append({
-                "venue": venue_name,
-                "race_no": race_no,
-                "race_time": race_time,
-                "win_rates": win_rates,
-                "names": names,
+                "venue": venue_name, "jcd": jcode.zfill(2),
+                "race_no": race_no, "race_time": race_time,
+                "win_rates": win_rates, "names": names,
             })
     return results
+
+
+def fetch_race_result(jcd, date_str, rno):
+    """
+    boatrace.jp から着順と三連単払戻を取得。
+    戻り値: {"finish_order": [2,1,6,3,4,5], "trifecta_combo": "2-1-6",
+             "trifecta_payout": 29960, "error": None}
+    """
+    info = {"finish_order": [], "trifecta_combo": "", "trifecta_payout": 0, "error": None}
+    try:
+        url = (f"{BOATRACE_URL}/owpc/pc/race/raceresult"
+               f"?rno={rno}&jcd={jcd}&hd={date_str}")
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        page_text = soup.get_text()
+
+        # ── 着順を取得 ──
+        # 着順テーブル: 着 | 枠 | ボートレーサー | レースタイム
+        tables = soup.find_all("table")
+        for table in tables:
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all(["th", "td"])
+                texts = [c.get_text(strip=True) for c in cells]
+                # ヘッダ行判定
+                if any("着" in t and "枠" in " ".join(texts) for t in texts):
+                    continue
+                # 着順の数字行: "１","2","5328 ..."
+                if len(texts) >= 3:
+                    # 枠番 (2番目のセル) を取得
+                    waku_text = texts[1] if len(texts) >= 2 else ""
+                    # 着順 (1番目のセル)
+                    chaku_text = texts[0]
+                    # 全角数字→半角
+                    chaku_text = chaku_text.translate(str.maketrans("１２３４５６７８９０", "1234567890"))
+                    waku_text = waku_text.translate(str.maketrans("１２３４５６７８９０", "1234567890"))
+                    if chaku_text.isdigit() and waku_text.isdigit():
+                        info["finish_order"].append(int(waku_text))
+
+        # ── 三連単払戻を取得 ──
+        # 勝式 | 組番 | 払戻金 | 人気
+        found_3t = False
+        for table in tables:
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all(["th", "td"])
+                texts = [c.get_text(strip=True) for c in cells]
+                if "3連単" in texts:
+                    found_3t = True
+                    # 組番と払戻金を取得
+                    idx = texts.index("3連単")
+                    remaining = texts[idx+1:]
+                    if len(remaining) >= 2:
+                        combo = remaining[0]  # "2-1-6"
+                        payout_str = remaining[1]  # "¥29,960"
+                        payout_str = payout_str.replace("¥", "").replace(",", "").replace("￥", "").strip()
+                        info["trifecta_combo"] = combo
+                        try:
+                            info["trifecta_payout"] = int(payout_str)
+                        except ValueError:
+                            info["trifecta_payout"] = 0
+
+        if not info["finish_order"]:
+            info["error"] = "結果未取得"
+
+    except Exception as e:
+        info["error"] = str(e)
+
+    return info
 
 
 def meets_condition(wr):
@@ -188,6 +225,14 @@ st.markdown("""
         background: #1a1a2e; color: #eee; border-radius: 12px;
         padding: 16px; margin-bottom: 16px; border-left: 4px solid #0f3460;
     }
+    .race-card-hit {
+        background: #1a1a2e; color: #eee; border-radius: 12px;
+        padding: 16px; margin-bottom: 16px; border-left: 4px solid #43A047;
+    }
+    .race-card-miss {
+        background: #1a1a2e; color: #eee; border-radius: 12px;
+        padding: 16px; margin-bottom: 16px; border-left: 4px solid #E53935;
+    }
     .race-header { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; }
     .race-time { color: #e94560; font-weight: bold; }
     .boat-badge {
@@ -199,9 +244,18 @@ st.markdown("""
     .rate-fill { height: 22px; border-radius: 4px; line-height: 22px;
                  padding-left: 6px; font-size: 12px; color: #fff; }
     .hit-marker { color: #e94560; font-weight: bold; }
+    .result-box { background: #16213e; border-radius: 8px; padding: 12px;
+                  margin-top: 10px; }
+    .result-hit { color: #43A047; font-weight: bold; font-size: 1.1em; }
+    .result-miss { color: #E53935; font-weight: bold; font-size: 1.1em; }
     .summary-table { width: 100%; border-collapse: collapse; font-size: 14px; }
     .summary-table th { background: #0f3460; color: #eee; padding: 8px; text-align: left; }
     .summary-table td { padding: 8px; border-bottom: 1px solid #333; }
+    .roi-box { background: #0f3460; border-radius: 12px; padding: 20px;
+               text-align: center; margin: 16px 0; }
+    .roi-value { font-size: 2em; font-weight: bold; }
+    .roi-positive { color: #43A047; }
+    .roi-negative { color: #E53935; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -218,6 +272,7 @@ with col2:
 
 if run:
     date_str = selected_date.strftime("%Y%m%d")
+    is_past = selected_date < date.today()
 
     with st.spinner("会場一覧を取得中..."):
         venues = get_venues(date_str)
@@ -226,10 +281,11 @@ if run:
         st.warning("開催中の会場がありません。")
         st.stop()
 
-    st.info(f"開催会場: {', '.join(v['name'] for v in venues)} ({len(venues)}場)")
+    st.info(f"開催会場: {', '.join(v['name'] for v in venues)} ({len(venues)}場)"
+            + ("　📊 過去日付のため結果・回収率も表示" if is_past else ""))
 
     hit_list = []
-    progress = st.progress(0, text="解析中...")
+    progress = st.progress(0, text="出走表を解析中...")
 
     for vi, v in enumerate(venues):
         progress.progress((vi + 1) / len(venues), text=f"{v['name']} を解析中...")
@@ -255,26 +311,101 @@ if run:
         st.warning("条件に合致するレースはありませんでした。")
         st.stop()
 
+    # ── 過去日付ならレース結果を取得 ──
+    if is_past:
+        progress2 = st.progress(0, text="レース結果を取得中...")
+        for ri, race in enumerate(hit_list):
+            progress2.progress((ri + 1) / len(hit_list),
+                               text=f"{race['venue']} {race['race_no']}R の結果取得中...")
+            result = fetch_race_result(race["jcd"], date_str, race["race_no"])
+            race["result"] = result
+            _time.sleep(0.4)
+        progress2.empty()
+
+    # ── 回収率計算 (過去日付のみ) ──
+    if is_past:
+        # 三連単 1-2-全通り = 1-2-3, 1-2-4, 1-2-5, 1-2-6 の4点 × 100円 = 400円/レース
+        bet_per_race = 400
+        total_invest = bet_per_race * len(hit_list)
+        total_payout = 0
+        hit_count = 0
+
+        for race in hit_list:
+            res = race.get("result", {})
+            combo = res.get("trifecta_combo", "")
+            payout = res.get("trifecta_payout", 0)
+            # 1-2-X の形式かチェック
+            if re.match(r"^1\s*[-－]\s*2\s*[-－]\s*\d$", combo):
+                total_payout += payout
+                race["is_hit"] = True
+                hit_count += 1
+            else:
+                race["is_hit"] = False
+
+        roi = (total_payout / total_invest * 100) if total_invest > 0 else 0
+        roi_class = "roi-positive" if roi >= 100 else "roi-negative"
+
+        st.markdown(f"""
+        <div class="roi-box">
+            <div style="color:#aaa;font-size:0.9em;">三連単 1-2-全通り (4点×100円) 回収率</div>
+            <div class="roi-value {roi_class}">{roi:.1f}%</div>
+            <div style="color:#888;font-size:0.85em;margin-top:6px;">
+                投資: ¥{total_invest:,} ({len(hit_list)}R × ¥400)　
+                回収: ¥{total_payout:,}　
+                的中: {hit_count}/{len(hit_list)}R
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     # ── サマリーテーブル ──
+    if is_past:
+        header = "<tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th><th>結果</th><th>三連単</th><th>払戻</th></tr>"
+    else:
+        header = "<tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th></tr>"
+
     rows_html = ""
     for r in hit_list:
         wr = r["win_rates"]
-        rows_html += f"""<tr>
-            <td><span class="race-time">{r['race_time']}</span></td>
-            <td><strong>{r['venue']}</strong></td>
-            <td>{r['race_no']}R</td>
-            <td>{wr[1]:.2f}</td>
-            <td>{wr[2]:.2f}</td>
-        </tr>"""
+        if is_past:
+            res = r.get("result", {})
+            fo = res.get("finish_order", [])
+            finish_str = "-".join(str(x) for x in fo[:3]) if fo else "---"
+            combo = res.get("trifecta_combo", "---")
+            payout = res.get("trifecta_payout", 0)
+            is_hit = r.get("is_hit", False)
+            payout_str = f"¥{payout:,}" if payout else "---"
+            if is_hit:
+                result_style = 'style="color:#43A047;font-weight:bold;"'
+            else:
+                result_style = 'style="color:#E53935;"'
+            rows_html += f"""<tr>
+                <td><span class="race-time">{r['race_time']}</span></td>
+                <td><strong>{r['venue']}</strong></td>
+                <td>{r['race_no']}R</td>
+                <td>{wr[1]:.2f}</td>
+                <td>{wr[2]:.2f}</td>
+                <td {result_style}>{finish_str}</td>
+                <td>{combo}</td>
+                <td {result_style}>{payout_str}</td>
+            </tr>"""
+        else:
+            rows_html += f"""<tr>
+                <td><span class="race-time">{r['race_time']}</span></td>
+                <td><strong>{r['venue']}</strong></td>
+                <td>{r['race_no']}R</td>
+                <td>{wr[1]:.2f}</td>
+                <td>{wr[2]:.2f}</td>
+            </tr>"""
 
     st.markdown(f"""
     <table class="summary-table">
-        <tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th></tr>
+        {header}
         {rows_html}
     </table>
     """, unsafe_allow_html=True)
 
     st.markdown("---")
+
     # ── 各レース詳細カード ──
     for race in hit_list:
         wr = race["win_rates"]
@@ -284,27 +415,68 @@ if run:
         detail_rows = ""
         for rank, (boat, rate) in enumerate(sorted_boats, 1):
             name = race["names"].get(boat, "---")
-            bg = BOAT_BG_COLORS[boat]
-            tc = BOAT_TEXT_COLORS[boat]
+            bg = BOAT_BG[boat]
+            tc = BOAT_TX[boat]
             pct = (rate / max_rate * 100) if max_rate else 0
             marker = ' <span class="hit-marker">◀</span>' if boat in (1, 2) else ""
-            
-            # HTMLタグの先頭の空白を無くします
-            detail_rows += f"""<div style="display:flex;align-items:center;margin:4px 0;">
-<span style="width:30px;color:#888;">{rank}位</span>
-<span class="boat-badge" style="background:{bg};color:{tc};">{boat}</span>
-<span style="width:100px;">{name}</span>
-<div class="rate-bar" style="flex:1;">
-<div class="rate-fill" style="width:{pct}%;background:{bg};">{rate:.2f}</div>
-</div>
-{marker}
-</div>"""
+            detail_rows += f"""
+            <div style="display:flex;align-items:center;margin:4px 0;">
+                <span style="width:30px;color:#888;">{rank}位</span>
+                <span class="boat-badge" style="background:{bg};color:{tc};">{boat}</span>
+                <span style="width:100px;">{name}</span>
+                <div class="rate-bar" style="flex:1;">
+                    <div class="rate-fill" style="width:{pct}%;background:{bg};">{rate:.2f}</div>
+                </div>
+                {marker}
+            </div>"""
 
-        # ここも先頭の空白を無くします
-        st.markdown(f"""<div class="race-card">
-<div class="race-header">
-【{race['venue']}】 {race['race_no']}R
-&nbsp;&nbsp; <span class="race-time">締切 {race['race_time']}</span>
-</div>
-{detail_rows}
-</div>""", unsafe_allow_html=True)
+        # 結果セクション (過去日付のみ)
+        result_html = ""
+        if is_past:
+            res = race.get("result", {})
+            fo = res.get("finish_order", [])
+            finish_str = "-".join(str(x) for x in fo[:3]) if fo else "---"
+            combo = res.get("trifecta_combo", "---")
+            payout = res.get("trifecta_payout", 0)
+            is_hit = race.get("is_hit", False)
+
+            if is_hit:
+                judge = f'<span class="result-hit">◎ 的中！ 払戻 ¥{payout:,}</span>'
+            else:
+                judge = '<span class="result-miss">✗ ハズレ</span>'
+
+            # 着順を枠番色バッジで表示
+            finish_badges = ""
+            for i, boat_no in enumerate(fo[:3]):
+                if 1 <= boat_no <= 6:
+                    fbg = BOAT_BG[boat_no]
+                    ftc = BOAT_TX[boat_no]
+                    finish_badges += f'<span class="boat-badge" style="background:{fbg};color:{ftc};">{boat_no}</span>'
+                    if i < 2:
+                        finish_badges += '<span style="color:#888;">→</span>'
+
+            result_html = f"""
+            <div class="result-box">
+                <div style="margin-bottom:6px;">
+                    <span style="color:#aaa;">着順: </span>{finish_badges}
+                    <span style="color:#888;margin-left:10px;">三連単: {combo}</span>
+                </div>
+                <div>{judge}</div>
+            </div>"""
+
+        # カードスタイル選択
+        if is_past:
+            card_class = "race-card-hit" if race.get("is_hit") else "race-card-miss"
+        else:
+            card_class = "race-card"
+
+        st.markdown(f"""
+        <div class="{card_class}">
+            <div class="race-header">
+                【{race['venue']}】 {race['race_no']}R
+                &nbsp;&nbsp; <span class="race-time">締切 {race['race_time']}</span>
+            </div>
+            {detail_rows}
+            {result_html}
+        </div>
+        """, unsafe_allow_html=True)
