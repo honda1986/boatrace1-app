@@ -2,7 +2,7 @@
 ボートレース 全国勝率フィルター (Streamlit版)
 
 条件: 全国勝率が 1号艇 > 2号艇 の順で、両方とも上位3位以内のレースを抽出
-過去日付の場合: レース結果 + 三連単 1-2-全通り購入時の回収率を表示
+過去日付の場合: レース結果 + 三連単 全-1,2-1,2 購入時の回収率を表示
 
 使い方:
   pip install streamlit requests beautifulsoup4
@@ -324,18 +324,18 @@ if run:
 
     # ── 回収率計算 (過去日付のみ) ──
     if is_past:
-        # 三連単 1-2-全通り = 1-2-3, 1-2-4, 1-2-5, 1-2-6 の4点 × 100円 = 400円/レース
-        bet_per_race = 400
+        # 三連単 全-1,2-1,2 = X-1-2, X-2-1 (X=3,4,5,6) の8点 × 100円 = 800円/レース
+        bet_per_race = 800
         total_invest = bet_per_race * len(hit_list)
         total_payout = 0
         hit_count = 0
 
         for race in hit_list:
             res = race.get("result", {})
-            combo = res.get("trifecta_combo", "")
+            fo = res.get("finish_order", [])
             payout = res.get("trifecta_payout", 0)
-            # 1-2-X の形式かチェック
-            if re.match(r"^1\s*[-－]\s*2\s*[-－]\s*\d$", combo):
+            # 2着と3着が1号艇・2号艇(順不同)なら的中
+            if len(fo) >= 3 and set(fo[1:3]) == {1, 2}:
                 total_payout += payout
                 race["is_hit"] = True
                 hit_count += 1
@@ -347,10 +347,10 @@ if run:
 
         st.markdown(f"""
         <div class="roi-box">
-            <div style="color:#aaa;font-size:0.9em;">三連単 1-2-全通り (4点×100円) 回収率</div>
+            <div style="color:#aaa;font-size:0.9em;">三連単 全-1,2-1,2 (8点×100円) 回収率</div>
             <div class="roi-value {roi_class}">{roi:.1f}%</div>
             <div style="color:#888;font-size:0.85em;margin-top:6px;">
-                投資: ¥{total_invest:,} ({len(hit_list)}R × ¥400)　
+                投資: ¥{total_invest:,} ({len(hit_list)}R × ¥800)　
                 回収: ¥{total_payout:,}　
                 的中: {hit_count}/{len(hit_list)}R
             </div>
@@ -359,7 +359,7 @@ if run:
 
     # ── サマリーテーブル ──
     if is_past:
-        header = "<tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th><th>結果</th><th>三連単</th><th>払戻</th></tr>"
+        header = "<tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th><th>結果</th><th>払戻</th></tr>"
     else:
         header = "<tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th></tr>"
 
@@ -370,10 +370,9 @@ if run:
             res = r.get("result", {})
             fo = res.get("finish_order", [])
             finish_str = "-".join(str(x) for x in fo[:3]) if fo else "---"
-            combo = res.get("trifecta_combo", "---")
             payout = res.get("trifecta_payout", 0)
             is_hit = r.get("is_hit", False)
-            payout_str = f"¥{payout:,}" if payout else "---"
+            payout_str = f"¥{payout:,}" if is_hit and payout else "---"
             if is_hit:
                 result_style = 'style="color:#43A047;font-weight:bold;"'
             else:
@@ -385,7 +384,6 @@ if run:
                 <td>{wr[1]:.2f}</td>
                 <td>{wr[2]:.2f}</td>
                 <td {result_style}>{finish_str}</td>
-                <td>{combo}</td>
                 <td {result_style}>{payout_str}</td>
             </tr>"""
         else:
@@ -407,7 +405,7 @@ if run:
     st.markdown("---")
 
     # ── 各レース詳細カード ──
-    for race in hit_list:
+  for race in hit_list:
         wr = race["win_rates"]
         sorted_boats = sorted(wr.items(), key=lambda x: x[1], reverse=True)
         max_rate = max(wr.values())
@@ -435,8 +433,6 @@ if run:
         if is_past:
             res = race.get("result", {})
             fo = res.get("finish_order", [])
-            finish_str = "-".join(str(x) for x in fo[:3]) if fo else "---"
-            combo = res.get("trifecta_combo", "---")
             payout = res.get("trifecta_payout", 0)
             is_hit = race.get("is_hit", False)
 
@@ -459,7 +455,6 @@ if run:
             <div class="result-box">
                 <div style="margin-bottom:6px;">
                     <span style="color:#aaa;">着順: </span>{finish_badges}
-                    <span style="color:#888;margin-left:10px;">三連単: {combo}</span>
                 </div>
                 <div>{judge}</div>
             </div>"""
