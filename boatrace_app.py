@@ -588,4 +588,291 @@ def fetch_race_times(jcd: str, date_str: str) -> dict[int, str]:
                     if m:
                         race_times[rno] = m.group(1)
         if not race_times:
-            full = so
+            full = soup.get_text(" ", strip=True)
+            for m in re.finditer(r"(\d{1,2})\s*R\s+(\d{1,2}:\d{2})", full):
+                race_times[int(m.group(1))] = m.group(2)
+        if not race_times:
+            tds = soup.find_all("td")
+            for i, td in enumerate(tds):
+                txt = td.get_text(strip=True)
+                rm = re.match(r"^(\d{1,2})R$", txt)
+                if rm and i + 1 < len(tds):
+                    rno = int(rm.group(1))
+                    next_txt = tds[i + 1].get_text(strip=True)
+                    tm = re.search(r"(\d{1,2}:\d{2})", next_txt)
+                    if tm:
+                        race_times[rno] = tm.group(1)
+    except Exception:
+        pass
+    return race_times
+
+
+def parse_racelist(jcode, date_str, venue_name, race_times):
+    url = f"{BASE_URL}/racelist.php?jcode={jcode}&date={date_str}"
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.encoding = "utf-8"
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    for h3 in soup.find_all("h3"):
+        race_label = h3.get_text(strip=True)
+        m = re.search(r"(\d{1,2})R", race_label)
+        if not m:
+            continue
+        race_no = int(m.group(1))
+        race_time = race_times.get(race_no, "--:--")
+        table = h3.find_next("table")
+        if not table:
+            continue
+        names, win_rates, in_zenkoku = {}, {}, False
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"])
+            texts = [c.get_text(strip=True) for c in cells]
+            if "氏名" in texts:
+                idx = texts.index("氏名")
+                for i, n in enumerate(texts[idx + 1: idx + 7]):
+                    if n:
+                        names[i + 1] = n
+            if "全国" in texts:
+                in_zenkoku = True
+            if "当地" in texts:
+                in_zenkoku = False
+            if in_zenkoku and "勝率" in texts and not win_rates:
+                idx = texts.index("勝率")
+                vals = texts[idx + 1: idx + 7]
+                if len(vals) == 6:
+                    try:
+                        win_rates = {i + 1: float(vals[i]) for i in range(6)}
+                    except ValueError:
+                        pass
+        if win_rates:
+            results.append({
+                "venue": venue_name,
+                "race_no": race_no,
+                "race_time": race_time,
+                "win_rates": win_rates,
+                "names": names,
+            })
+    return results
+
+
+def meets_condition(wr):
+    if 1 not in wr or 2 not in wr:
+        return False
+    if wr[1] <= wr[2]:
+        return False
+    sorted_vals = sorted(wr.values(), reverse=True)
+    top3_min = sorted_vals[2]
+    return wr[1] >= top3_min and wr[2] >= top3_min
+
+
+# ──────────────── Streamlit UI ────────────────
+st.set_page_config(page_title="ボートレース 勝率フィルター", page_icon="🚤", layout="centered")
+
+st.markdown("""
+<style>
+    .race-card {
+        background: #1a1a2e; color: #eee; border-radius: 12px;
+        padding: 16px; margin-bottom: 16px; border-left: 4px solid #0f3460;
+    }
+    .race-header { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; }
+    .race-time { color: #e94560; font-weight: bold; }
+    .boat-badge {
+        display: inline-block; width: 28px; height: 28px; line-height: 28px;
+        text-align: center; border-radius: 50%; font-weight: bold; font-size: 14px;
+        margin-right: 6px;
+    }
+    .rate-bar { background: #16213e; border-radius: 4px; height: 22px; margin: 2px 0; }
+    .rate-fill { height: 22px; border-radius: 4px; line-height: 22px;
+                 padding-left: 6px; font-size: 12px; color: #fff; }
+    .hit-marker { color: #e94560; font-weight: bold; }
+    .summary-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .summary-table th { background: #0f3460; color: #eee; padding: 8px; text-align: left; }
+    .summary-table td { padding: 8px; border-bottom: 1px solid #333; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🚤 ボートレース 全国勝率フィルター")
+st.caption("全国勝率が 1号艇 > 2号艇 の順で、両方とも上位3位以内のレースを抽出")
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    selected_date = st.date_input("対象日", value=date.today())
+with col2:
+    st.write("")
+    st.write("")
+    run = st.button("🔍 検索", use_container_width=True, type="primary")
+
+if run:
+    date_str = selected_date.strftime("%Y%m%d")
+
+    with st.spinner("会場一覧を取得中..."):
+        venues = get_venues(date_str)
+
+    if not venues:
+        st.warning("開催中の会場がありません。")
+        st.stop()
+
+    st.info(f"開催会場: {', '.join(v['name'] for v in venues)} ({len(venues)}場)")
+
+    hit_list = []
+    progress = st.progress(0, text="解析中...")
+
+    for vi, v in enumerate(venues):
+        progress.progress((vi + 1) / len(venues), text=f"{v['name']} を解析中...")
+        race_times = fetch_race_times(v["jcd"], date_str)
+        _time.sleep(0.3)
+        try:
+            races = parse_racelist(v["jcode"], date_str, v["name"], race_times)
+        except Exception:
+            continue
+        for race in races:
+            if meets_condition(race["win_rates"]):
+                hit_list.append(race)
+        _time.sleep(0.3)
+
+    progress.empty()
+
+    # 出走時刻順ソート
+    hit_list.sort(key=lambda r: r["race_time"] if r["race_time"] != "--:--" else "99:99")
+
+    st.markdown(f"### ★ 該当レース: {len(hit_list)} 件")
+
+    if not hit_list:
+        st.warning("条件に合致するレースはありませんでした。")
+        st.stop()
+
+    # ── サマリーテーブル ──
+    rows_html = ""
+    for r in hit_list:
+        wr = r["win_rates"]
+        rows_html += f"""<tr>
+            <td><span class="race-time">{r['race_time']}</span></td>
+            <td><strong>{r['venue']}</strong></td>
+            <td>{r['race_no']}R</td>
+            <td>{wr[1]:.2f}</td>
+            <td>{wr[2]:.2f}</td>
+        </tr>"""
+
+    st.markdown(f"""
+    <table class="summary-table">
+        <tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th></tr>
+        {rows_html}
+    </table>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── 各レース詳細カード + スコアリング ──
+    for race in hit_list:
+        wr = race["win_rates"]
+        sorted_boats = sorted(wr.items(), key=lambda x: x[1], reverse=True)
+        max_rate = max(wr.values())
+
+        detail_rows = ""
+        for rank, (boat, rate) in enumerate(sorted_boats, 1):
+            name = race["names"].get(boat, "---")
+            bg = BOAT_BG_COLORS[boat]
+            tc = BOAT_TEXT_COLORS[boat]
+            pct = (rate / max_rate * 100) if max_rate else 0
+            marker = ' <span class="hit-marker">◀</span>' if boat in (1, 2) else ""
+            detail_rows += f"""
+            <div style="display:flex;align-items:center;margin:4px 0;">
+                <span style="width:30px;color:#888;">{rank}位</span>
+                <span class="boat-badge" style="background:{bg};color:{tc};">{boat}</span>
+                <span style="width:100px;">{name}</span>
+                <div class="rate-bar" style="flex:1;">
+                    <div class="rate-fill" style="width:{pct}%;background:{bg};">{rate:.2f}</div>
+                </div>
+                {marker}
+            </div>"""
+
+        st.markdown(f"""
+        <div class="race-card">
+            <div class="race-header">
+                【{race['venue']}】 {race['race_no']}R
+                &nbsp;&nbsp; <span class="race-time">締切 {race['race_time']}</span>
+            </div>
+            {detail_rows}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── スコアリング＆予想 ──
+        jcd_for_race = None
+        for v in venues:
+            if v["name"] == race["venue"]:
+                jcd_for_race = v["jcd"]
+                break
+        if not jcd_for_race:
+            continue
+
+        with st.spinner(f"{race['venue']} {race['race_no']}R スコアリング中..."):
+            try:
+                before_info = fetch_beforeinfo(jcd_for_race, date_str, race["race_no"])
+                _time.sleep(0.3)
+                detail_info = fetch_racelist_detail(jcd_for_race, date_str, race["race_no"])
+                _time.sleep(0.3)
+            except Exception:
+                before_info = {}
+                detail_info = {}
+
+            scores = calc_scores(race, before_info, detail_info, jcd_for_race)
+            scenario = predict_scenario(scores, before_info, detail_info)
+
+        # スコア一覧表示
+        score_rows = ""
+        for b in sorted(scores.keys(), key=lambda x: scores[x]["total"], reverse=True):
+            s = scores[b]
+            bg = BOAT_BG_COLORS[b]
+            tc = BOAT_TEXT_COLORS[b]
+            name = race["names"].get(b, detail_info.get("names", {}).get(b, "---"))
+            bar_w = max(0, min(100, (s["total"] + 20) / 47.5 * 100))
+            score_rows += f"""
+            <div style="display:flex;align-items:center;margin:3px 0;">
+                <span class="boat-badge" style="background:{bg};color:{tc};font-size:12px;">{b}</span>
+                <span style="width:80px;font-size:13px;">{name}</span>
+                <div style="flex:1;background:#16213e;border-radius:4px;height:20px;margin:0 8px;">
+                    <div style="width:{bar_w}%;background:{'#e94560' if b == 1 else '#0f3460'};height:20px;border-radius:4px;"></div>
+                </div>
+                <span style="font-weight:bold;font-size:14px;width:50px;text-align:right;color:{'#e94560' if s['total'] >= 15 else '#eee'};">
+                    {s['total']:.1f}
+                </span>
+            </div>"""
+
+        # 展開シナリオ
+        pattern = scenario.get("pattern", "不明")
+        bets = scenario.get("trifecta_bets", [])
+        bets_str = " / ".join(f"{a}-{b2}-{c}" for a, b2, c in bets[:6])
+        cands_2 = scenario.get("candidates_2nd", [])
+        cands_3 = scenario.get("candidates_3rd", [])
+
+        # スコア差判定
+        s_vals = sorted([scores[b]["total"] for b in range(1, 7)], reverse=True)
+        gap = s_vals[0] - s_vals[1] if len(s_vals) >= 2 else 0
+        if gap >= 3:
+            conf = "◎ 明確な実力差"
+        elif gap >= 1:
+            conf = "○ やや優位"
+        else:
+            conf = "△ 混戦"
+
+        st.markdown(f"""
+        <div style="background:#0f3460;border-radius:8px;padding:12px;margin:-8px 0 16px 0;">
+            <div style="font-weight:bold;margin-bottom:8px;color:#e94560;">📊 スコアリング結果</div>
+            {score_rows}
+            <div style="margin-top:10px;padding-top:8px;border-top:1px solid #444;">
+                <div style="font-size:13px;color:#aaa;">
+                    🎯 展開予測: <strong style="color:#fff;">{pattern}</strong>
+                    &nbsp;|&nbsp; 信頼度: <strong style="color:#fff;">{conf}</strong> (差 {gap:.1f}pt)
+                </div>
+                <div style="font-size:13px;color:#aaa;margin-top:4px;">
+                    🏁 2着候補: <strong style="color:#FDD835;">{', '.join(str(c)+'号艇' for c in cands_2)}</strong>
+                </div>
+                <div style="font-size:13px;margin-top:6px;color:#aaa;">
+                    🎰 三連単（1着1号艇固定）:
+                </div>
+                <div style="font-size:15px;font-weight:bold;color:#e94560;margin-top:2px;">
+                    {bets_str}
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
