@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, date
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ──────────────── 定数 ────────────────
 BASE_URL = "https://uchisankaku.sakura.ne.jp"
@@ -668,8 +669,9 @@ def meets_condition(wr):
 # ──────────────── Streamlit UI ────────────────
 st.set_page_config(page_title="ボートレース 勝率フィルター", page_icon="🚤", layout="centered")
 
-st.markdown("""
+COMMON_CSS = """
 <style>
+    body { background: transparent; color: #eee; font-family: sans-serif; margin: 0; padding: 0; }
     .race-card {
         background: #1a1a2e; color: #eee; border-radius: 12px;
         padding: 16px; margin-bottom: 16px; border-left: 4px solid #0f3460;
@@ -689,7 +691,12 @@ st.markdown("""
     .summary-table th { background: #0f3460; color: #eee; padding: 8px; text-align: left; }
     .summary-table td { padding: 8px; border-bottom: 1px solid #333; }
 </style>
-""", unsafe_allow_html=True)
+"""
+
+def render_html(html_content: str, height: int = 300):
+    """components.html でHTMLを確実にレンダリング"""
+    full = f"<html><head>{COMMON_CSS}</head><body>{html_content}</body></html>"
+    components.html(full, height=height, scrolling=False)
 
 st.title("🚤 ボートレース 全国勝率フィルター")
 st.caption("全国勝率が 1号艇 > 2号艇 の順で、両方とも上位3位以内のレースを抽出")
@@ -753,12 +760,13 @@ if run:
             <td>{wr[2]:.2f}</td>
         </tr>"""
 
-    st.markdown(f"""
+    table_height = 50 + len(hit_list) * 40
+    render_html(f"""
     <table class="summary-table">
         <tr><th>時刻</th><th>会場</th><th>R</th><th>1号艇</th><th>2号艇</th></tr>
         {rows_html}
     </table>
-    """, unsafe_allow_html=True)
+    """, height=table_height)
 
     st.markdown("---")
 
@@ -786,7 +794,9 @@ if run:
                 {marker}
             </div>"""
 
-        st.markdown(f"""
+        num_boats = len(sorted_boats)
+        card_height = 60 + num_boats * 36
+        render_html(f"""
         <div class="race-card">
             <div class="race-header">
                 【{race['venue']}】 {race['race_no']}R
@@ -794,7 +804,7 @@ if run:
             </div>
             {detail_rows}
         </div>
-        """, unsafe_allow_html=True)
+        """, height=card_height)
 
         # ── スコアリング＆予想 ──
         jcd_for_race = None
@@ -855,8 +865,8 @@ if run:
         else:
             conf = "△ 混戦"
 
-        st.markdown(f"""
-        <div style="background:#0f3460;border-radius:8px;padding:12px;margin:-8px 0 16px 0;">
+        render_html(f"""
+        <div style="background:#0f3460;border-radius:8px;padding:12px;margin:0;">
             <div style="font-weight:bold;margin-bottom:8px;color:#e94560;">📊 スコアリング結果</div>
             {score_rows}
             <div style="margin-top:10px;padding-top:8px;border-top:1px solid #444;">
@@ -875,4 +885,4 @@ if run:
                 </div>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """, height=340)
