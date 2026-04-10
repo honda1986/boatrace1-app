@@ -567,11 +567,14 @@ def predict_scenario(scores: dict, before_info: dict, detail: dict) -> dict:
 
     # 三連単買い目生成 (1着=1号艇固定)
     bets = []
+    EXCLUDE_BETS = {(1, 2, 3), (1, 3, 2)}
     for sec in candidates_2nd[:3]:
         thirds = [b for b in range(2, 7) if b != sec]
         thirds.sort(key=lambda b: scores[b]["total"], reverse=True)
         for trd in thirds[:2]:
-            bets.append((1, sec, trd))
+            bet = (1, sec, trd)
+            if bet not in EXCLUDE_BETS:
+                bets.append(bet)
 
     scenario["trifecta_bets"] = bets
     return scenario
