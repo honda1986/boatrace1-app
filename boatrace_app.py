@@ -549,66 +549,108 @@ def predict_scenario(scores: dict, before_info: dict, detail: dict) -> dict:
 
 def fetch_race_result(jcd: str, date_str: str, rno: int) -> dict:
     """レース結果ページから着順と払戻金を取得"""
-    result = {"order": [], "trifecta_payout": 0, "trio_payout": 0}
+    result = {"order": [], "trifecta_payout": 0, "trio_payout": 0, "debug": ""}
     try:
         url = f"{BOATRACE_URL}/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={date_str}"
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
+        full_text = soup.get_text(" ", strip=True)
 
-        # 着順テーブル
-        result_tables = soup.find_all("table", class_=re.compile(r"is-w495|is-w238"))
-        for tbl in soup.find_all("table"):
-            rows = tbl.find_all("tr")
-            for row in rows:
-                cells = row.find_all("td")
-                texts = [c.get_text(strip=True) for c in cells]
-                # 着順行: "1" "1号艇" "選手名" ...
-                if texts and re.match(r"^[1-6]$", texts[0]):
-                    rank = int(texts[0])
-                    # 枠番を探す
-                    for t in texts[1:]:
-                        bm = re.match(r"^(\d)$", t)
-                        if bm and 1 <= int(bm.group(1)) <= 6:
-                            if len(result["order"]) == rank - 1:
-                                result["order"].append(int(bm.group(1)))
-                            break
+        if "ただいま集計中" in full_text or "準備中" in full_text:
+            result["debug"] = "結果未確定"
+            return result
 
-        # 着順が取れなかった場合の別パース
+        # ── 着順取得: is-boatColor クラスから ──
+        for el in soup.find_all(class_=re.compile(r"is-boatColor\d")):
+            cls_str = " ".join(el.get("class", []))
+            m = re.search(r"is-boatColor(\d)", cls_str)
+            if m:
+                boat = int(m.group(1))
+                # 着順テーブル内のものだけ拾う (親にtableがある)
+                parent_tbl = el.find_parent("table")
+                if parent_tbl:
+                    parent_text = " ".join(parent_tbl.find("tr").get_text(" ", strip=True) if parent_tbl.find("tr") else "")
+                    # 出走表テーブルは除外 (着順テーブルは行が少ない)
+                    rows_in_tbl = parent_tbl.find_all("tr")
+                    if len(rows_in_tbl) <= 8 and boat not in result["order"]:
+                        result["order"].append(boat)
+
+        # ── フォールバック1: tbody行を順番に読む ──
         if len(result["order"]) < 3:
             result["order"] = []
             for tbl in soup.find_all("table"):
-                caption = tbl.find("caption") or tbl.find_previous("h3")
-                tbl_text = (caption.get_text(strip=True) if caption else "") + tbl.get_text(" ", strip=True)
-                if "着順" in tbl_text or "成績" in tbl_text:
-                    for row in tbl.find_all("tr"):
-                        cells = row.find_all("td")
-                        if not cells:
-                            continue
-                        texts = [c.get_text(strip=True) for c in cells]
-                        # 枠番色のクラスから判定
+                tbl_html = str(tbl)
+                # 着順テーブルの特徴: "着" ヘッダがある
+                ths = [th.get_text(strip=True) for th in tbl.find_all("th")]
+                if not any("着" in h for h in ths):
+                    continue
+                for row in tbl.find_all("tr"):
+                    tds = row.find_all("td")
+                    if len(tds) < 2:
+                        continue
+                    # 各セルを調べて枠番(boatColor)を探す
+                    for td in tds:
+                        bc = td.find(class_=re.compile(r"is-boatColor(\d)"))
+                        if bc:
+                            m2 = re.search(r"is-boatColor(\d)", " ".join(bc.get("class", [])))
+                            if m2:
+                                b = int(m2.group(1))
+                                if b not in result["order"]:
+                                    result["order"].append(b)
+                                break
+                if len(result["order"]) >= 3:
+                    break
+
+        # ── フォールバック2: 全テーブルからtd[0]=1-6の連番パターン ──
+        if len(result["order"]) < 3:
+            result["order"] = []
+            for tbl in soup.find_all("table"):
+                temp_order = []
+                for row in tbl.find_all("tr"):
+                    tds = row.find_all("td")
+                    if len(tds) >= 3:
+                        texts = [td.get_text(strip=True) for td in tds]
+                        if re.match(r"^[1-6]$", texts[0]):
+                            rank = int(texts[0])
+                            if rank == len(temp_order) + 1:
+                                # 2番目のセルが枠番
+                                for t in texts[1:4]:
+                                    if re.match(r"^[1-6]$", t):
+                                        temp_order.append(int(t))
+                                        break
+                if len(temp_order) >= 3:
+                    result["order"] = temp_order
+                    break
+
+        # ── 払戻金 ──
+        # テーブルから払戻を探す
+        for tbl in soup.find_all("table"):
+            tbl_text = tbl.get_text(" ", strip=True)
+            if "3連単" in tbl_text or "三連単" in tbl_text:
+                for row in tbl.find_all("tr"):
+                    cells = row.find_all("td")
+                    row_text = row.get_text(" ", strip=True)
+                    if ("3連単" in row_text or "三連単" in row_text) and result["trifecta_payout"] == 0:
+                        # 金額を探す
                         for cell in cells:
-                            boat_span = cell.find("span", class_=re.compile(r"is-boatColor"))
-                            if boat_span:
-                                bn = re.search(r"(\d)", boat_span.get_text(strip=True))
-                                if bn:
-                                    boat = int(bn.group(1))
-                                    if boat not in result["order"]:
-                                        result["order"].append(boat)
+                            ct = cell.get_text(strip=True).replace(",", "").replace("円", "").replace("¥", "")
+                            if re.match(r"^\d{3,}$", ct):
+                                result["trifecta_payout"] = int(ct)
+                                break
 
-        # 払戻金
-        full_text = soup.get_text(" ", strip=True)
-        # 3連単
-        tri_match = re.search(r"3連単[^\d]*?([\d,]+)円", full_text)
-        if tri_match:
-            result["trifecta_payout"] = int(tri_match.group(1).replace(",", ""))
-        # 3連複
-        trio_match = re.search(r"3連複[^\d]*?([\d,]+)円", full_text)
-        if trio_match:
-            result["trio_payout"] = int(trio_match.group(1).replace(",", ""))
+        # テキストからフォールバック
+        if result["trifecta_payout"] == 0:
+            for pat in [r"3連単.*?([\d,]+)\s*円", r"三連単.*?([\d,]+)\s*円"]:
+                m = re.search(pat, full_text)
+                if m:
+                    result["trifecta_payout"] = int(m.group(1).replace(",", ""))
+                    break
 
-    except Exception:
-        pass
+        result["debug"] = f"着順{len(result['order'])}件, 払戻{result['trifecta_payout']}円"
+
+    except Exception as e:
+        result["debug"] = f"Error: {str(e)[:100]}"
     return result
 
 
@@ -835,8 +877,8 @@ if run:
 
     st.markdown("---")
 
-    # 過去日判定
-    is_past = selected_date < date.today()
+    # 過去日判定（当日も含む＝結果が出ている可能性）
+    is_past = selected_date <= date.today()
 
     # 回収率集計用
     total_bet_cost = 0
@@ -969,6 +1011,7 @@ if run:
 
             order = race_result.get("order", [])
             tri_pay = race_result.get("trifecta_payout", 0)
+            debug_msg = race_result.get("debug", "")
 
             if len(order) >= 3:
                 result_count += 1
@@ -1008,6 +1051,8 @@ if run:
                     </div>
                 </div>
                 """, height=280)
+            else:
+                st.caption(f"⚠️ 結果取得不可 ({debug_msg})")
 
     # ── 全体回収率サマリー ──
     if is_past and result_count > 0:
