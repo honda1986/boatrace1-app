@@ -405,7 +405,7 @@ if run:
     st.markdown("---")
 
     # ── 各レース詳細カード ──
-  for race in hit_list:
+   for race in hit_list:
         wr = race["win_rates"]
         sorted_boats = sorted(wr.items(), key=lambda x: x[1], reverse=True)
         max_rate = max(wr.values())
