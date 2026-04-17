@@ -1,21 +1,19 @@
 """
-🚤 ボートレース予想アプリ v15.0 (戦略転換 / 荒れレース検出+3連単BOX)
+🚤 ボートレース予想アプリ v15.1 (荒れレース・ハンター / 本物の荒れだけに絞る)
 ━━━━━━━━━━━━━━━━━━━━━━━━
 データソース: uchisankaku.sakura.ne.jp（コース別・節間・全選手データ・決まり手）
              boatrace.jp（開催場一覧・直前情報・レース結果）
 
-v14.x → v15.0 完全戦略転換:
-  【旧】1号艇確殺ハイエナ → 19件中的中2件・回収率42.5%で失敗
-  【新】荒れレース検出 → 上位3艇の3連単BOX(6点/600円)
+v15.0 → v15.1 変更点:
+  【問題】1週間434件抽出、的中率21.4%、回収率66.2%
+         → 抽出多すぎ & ガチガチ決着（1-2-3系）を拾いすぎて配当が低い
 
-検出条件:
-  ・A1/A2が2艇以上（強豪分散）
-  ・上位3艇のスコア差が小さい（max-min ≤ 3.0）
-  ・1号艇が圧倒的でない（1C最上位でもスコア差<2.0）
-  ・除外場: 徳山・大村・芦屋（イン最強で荒れにくい）
-
-スコアリング:
-  勝率×1.0 + ST加点 + モーター加点 + クラス加点 + コース補正 + F減点
+  【改善】以下の追加条件で「本物の荒れ」だけに絞る:
+   ★ 上位3艇に 5号艇 or 6号艇 を含む、OR 1号艇が上位3艇圏外
+     → これで「1-2-3決着」系の低配当レースを除外
+   ・スコア差閾値 3.0 → 2.5 (より厳密な混戦)
+   ・A級2艇以上 → 3艇以上 (強豪密度UP)
+   ・平均勝率 4.5 → 5.0 (低レベル混戦を除外)
 """
 import streamlit as st
 import requests
@@ -130,7 +128,7 @@ def parse_uchi_race(html, race_no):
         label = ""
         for t in texts[:-6]:
             t = t.replace("　"," ").strip()
-            if t and t not in ("選手情報","成績","コース別／直近６カ月","決り手","モーター","今節成績","","枠"):
+            if t and t not in ("選手情報","成績","コース別/直近６カ月","決り手","モーター","今節成績","","枠"):
                 label = t
                 break
         if not label and len(texts) > 7:
@@ -215,7 +213,7 @@ def parse_uchi_race(html, race_no):
         racers.append(r)
     return racers
 
-# ━━━━━━━━━━━ v15.0 新戦略: 荒れレース検出 ━━━━━━━━━━━
+# ━━━━━━━━━━━ v15.1 荒れレース検出 ━━━━━━━━━━━
 
 COURSE_BOOST = {1: 3.0, 2: 1.5, 3: 1.0, 4: 0.5, 5: 0.0, 6: -0.5}
 CLASS_BOOST = {"A1": 2.0, "A2": 1.0, "B1": 0.0, "B2": -1.0}
@@ -225,7 +223,6 @@ def get_eff_st(r):
     return s if (s > 0 and s != 0.15) else r.get("avg_st", 0.15)
 
 def calculate_boat_score(r):
-    """全艇共通のスコアリング"""
     course = r["course"]
     nr = r.get("national_rate", 5.0)
     st = get_eff_st(r)
@@ -247,11 +244,9 @@ def calculate_boat_score(r):
     return round(score, 2)
 
 def evaluate_chaos_race(racers, jcd):
-    # イン最強場は除外
     if jcd in EXCLUDED_VENUES:
         return None
     
-    # 全艇スコアリング
     scored = [(r["course"], calculate_boat_score(r), r) for r in racers]
     scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
     
@@ -259,60 +254,65 @@ def evaluate_chaos_race(racers, jcd):
     top3_courses = [c for c, _, _ in top3]
     top3_scores = [s for _, s, _ in top3]
     
-    # ━━━ 混戦条件 ━━━
-    # 1. 上位3艇のスコア差 ≤ 3.0
-    score_spread = top3_scores[0] - top3_scores[2]
-    if score_spread > 3.0:
-        return None  # 実力差あり → 堅い決着 → 荒れない
+    # ━━━ 厳格な混戦条件 v15.1 ━━━
     
-    # 2. 1号艇が圧倒的じゃない
-    score_by_course = {c: s for c, s, _ in scored}
-    max_score = top3_scores[0]
-    s1 = score_by_course.get(1, 0)
-    # 1号艇が最高スコアの場合、2位との差が2.0以上なら堅い
+    # 1. 上位3艇のスコア差 ≤ 2.5 (v15.0: 3.0)
+    score_spread = top3_scores[0] - top3_scores[2]
+    if score_spread > 2.5:
+        return None
+    
+    # 2. A1/A2が3艇以上 (v15.0: 2艇)
+    classes = [r.get("class", "B1") for r in racers]
+    a_count = sum(1 for c in classes if c in ["A1", "A2"])
+    if a_count < 3:
+        return None
+    
+    # 3. 平均勝率 ≥ 5.0 (v15.0: 4.5)
+    avg_rate = sum(r.get("national_rate", 5.0) for r in racers) / 6
+    if avg_rate < 5.0:
+        return None
+    
+    # ★ 4. 本物の荒れ条件（v15.1 新規）:
+    #    上位3艇に 5号艇 or 6号艇 を含む、OR 1号艇が上位3艇圏外
+    has_outside = (5 in top3_courses) or (6 in top3_courses)
+    no_inner_1 = (1 not in top3_courses)
+    if not (has_outside or no_inner_1):
+        return None  # 1-2-3系のガチガチ決着は除外
+    
+    # 5. 1号艇が圧倒的でない（既存条件、維持）
     if top3_courses[0] == 1 and (top3_scores[0] - top3_scores[1]) > 2.0:
         return None
     
-    # 3. A1/A2が2艇以上（強豪分散）
-    classes = [r.get("class", "B1") for r in racers]
-    a_count = sum(1 for c in classes if c in ["A1", "A2"])
-    if a_count < 2:
-        return None
-    
-    # 4. 最低実力ライン（全員B2だと荒れすぎて予想不能）
-    avg_rate = sum(r.get("national_rate", 5.0) for r in racers) / 6
-    if avg_rate < 4.5:
-        return None
-    
-    # 混戦スコア（高いほど良い抽出候補）
+    # 荒れスコア（高いほど狙い目）
     chaos_score = (
-        (3.0 - score_spread)  # スコア差が小さいほど+
-        + a_count * 0.5        # A級密度
-        + (avg_rate - 4.5)     # 全体レベル
+        (2.5 - score_spread)
+        + a_count * 0.5
+        + (avg_rate - 5.0)
     )
+    # 5or6絡み or 1C圏外 には追加ボーナス
+    if has_outside:
+        chaos_score += 1.0
+    if no_inner_1:
+        chaos_score += 1.5
     
     # 上位3艇の3連単BOX
     top3_sorted_nums = sorted(top3_courses)
     buy_patterns = [list(p) for p in itertools.permutations(top3_sorted_nums, 3)]
     pred_str = f"{top3_sorted_nums[0]}={top3_sorted_nums[1]}={top3_sorted_nums[2]} 3連単BOX (6点)"
-    
-    # 3連複BOX（参考）
     sanrenpuku_str = f"{top3_sorted_nums[0]}={top3_sorted_nums[1]}={top3_sorted_nums[2]} (1点)"
     
-    stars = "★★★" if chaos_score >= 3.5 else "★★☆" if chaos_score >= 2.0 else "★☆☆"
+    stars = "★★★" if chaos_score >= 4.0 else "★★☆" if chaos_score >= 2.5 else "★☆☆"
     
-    # 理由タグ
     reasons = [
         f"A級{a_count}艇",
         f"上位差{score_spread:.1f}",
         f"平均{avg_rate:.1f}",
     ]
-    if 1 in top3_sorted_nums:
-        reasons.append("1C含む")
-    else:
-        reasons.append("1C圏外")
+    if no_inner_1:
+        reasons.append("1C圏外★")
+    elif has_outside:
+        reasons.append("5/6C絡み★")
     
-    # 全艇スコア表示用
     all_scores = sorted(scored, key=lambda x: x[0])
     score_info = " ".join(f"{c}C({s:.1f})" for c, s, _ in all_scores)
     
@@ -334,7 +334,7 @@ def daterange(start_date, end_date):
 
 # ━━━━━━━━━━━ UI ━━━━━━━━━━━
 def main():
-    st.set_page_config(page_title="🚤 荒れレース・ハンター v15.0",page_icon="🌊",layout="wide",initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="🚤 荒れレース・ハンター v15.1",page_icon="🌊",layout="wide",initial_sidebar_state="collapsed")
     st.markdown("""<style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
     .stApp{background:linear-gradient(135deg,#0a0a1a,#0d1b2a 40%,#1b2838);font-family:'Noto Sans JP',sans-serif}
@@ -345,7 +345,7 @@ def main():
     .sl{font-size:12px;font-weight:700;color:#1B6DB5;letter-spacing:2px;margin-bottom:8px}
     </style>""",unsafe_allow_html=True)
     
-    st.markdown('<div class="hdr"><span style="font-size:32px">🌊</span><div><h1>BOAT RACE AI</h1><div class="sub">v15.0 ─ 荒れレース検出 × 上位3艇3連単BOX</div></div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hdr"><span style="font-size:32px">🌊</span><div><h1>BOAT RACE AI</h1><div class="sub">v15.1 ─ 本物の荒れレースのみ（5/6C絡み or 1C圏外）</div></div></div>',unsafe_allow_html=True)
 
     st.markdown('<div class="card"><div class="sl">STEP 1 ─ 対象期間（最大31日）</div>',unsafe_allow_html=True)
     sel_dates = st.date_input("対象期間", value=(date.today(), date.today()), label_visibility="collapsed")
@@ -362,7 +362,7 @@ def main():
         
     st.markdown('</div>',unsafe_allow_html=True)
 
-    if st.button(f"🌊 指定期間をまとめて解析（荒れハンター v15.0）", type="primary", use_container_width=True):
+    if st.button(f"🌊 指定期間をまとめて解析（荒れハンター v15.1）", type="primary", use_container_width=True):
         date_list = list(daterange(s_date, e_date))
         total_days = len(date_list)
         
@@ -459,6 +459,7 @@ def main():
         
         hit_count = sum(1 for m in matches if m["hit"])
         hit_rate = (hit_count / fin * 100) if fin > 0 else 0
+        avg_payout = (ret / hit_count) if hit_count > 0 else 0
 
         st.markdown('<div style="background:rgba(27, 109, 181, 0.1); padding:16px; border-radius:12px; border:1px solid #1B6DB5; margin-bottom:16px;">', unsafe_allow_html=True)
         date_range_str = f"{s_date.strftime('%m/%d')} 〜 {e_date.strftime('%m/%d')}" if s_date != e_date else f"{s_date.strftime('%m/%d')}"
@@ -471,6 +472,7 @@ def main():
             f"<div style='display:flex; justify-content:space-around; background:rgba(0,0,0,0.3); padding:16px; border-radius:8px; margin-top:12px; margin-bottom:20px; border:1px solid rgba(255,255,255,0.1); flex-wrap:wrap; gap:8px;'>"
             f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>終了</span><br><span style='font-size:20px;font-weight:bold;'>{fin}<span style='font-size:13px;'>件</span></span></div>"
             f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>的中</span><br><span style='font-size:20px;font-weight:bold;color:{hit_color};'>{hit_count}<span style='font-size:13px;'>件 ({hit_rate:.1f}%)</span></span></div>"
+            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>平均配当</span><br><span style='font-size:20px;font-weight:bold;color:#F5C518;'>{int(avg_payout):,}<span style='font-size:13px;'>円</span></span></div>"
             f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>投資</span><br><span style='font-size:20px;font-weight:bold;'>{inv:,}<span style='font-size:13px;'>円</span></span></div>"
             f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>払戻</span><br><span style='font-size:20px;font-weight:bold;color:{roi_color};'>{ret:,}<span style='font-size:13px;'>円</span></span></div>"
             f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>回収率</span><br><span style='font-size:22px;font-weight:900;color:{roi_color};'>{roi:.1f}<span style='font-size:15px;'>%</span></span></div>"
@@ -487,7 +489,7 @@ def main():
                 if m["is_finished"] and not m["hit"]:
                     miss_badge = "<span style='background:#E8212A; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px;'>不的中</span>"
 
-                sc_color = "#F5C518" if m["score"] >= 3.5 else "#1B6DB5"
+                sc_color = "#F5C518" if m["score"] >= 4.0 else "#1B6DB5"
 
                 reason_tags = " ".join(
                     f"<span style='background:rgba(255,255,255,0.08);padding:1px 6px;border-radius:3px;font-size:11px;color:#ccc;margin-right:4px;'>{r}</span>"
