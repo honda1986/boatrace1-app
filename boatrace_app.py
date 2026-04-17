@@ -1,24 +1,21 @@
 """
-🚤 ボートレース予想アプリ v14.4 (条件厳格化＋買い目最適化 / 両立版)
+🚤 ボートレース予想アプリ v14.5 (v14.3ベース + 最小限改善)
 ━━━━━━━━━━━━━━━━━━━━━━━━
 データソース: uchisankaku.sakura.ne.jp（コース別・節間・全選手データ・決まり手）
              boatrace.jp（開催場一覧・直前情報・レース結果）
 
-v14.3 → v14.4 変更点:
-  【条件厳格化：的中率UP】
-   ・1号艇勝率 < 5.4 → < 5.2
-   ・致命傷 1つ以上 → 2つ以上 or 強致命傷1つ (F2/ST≥0.19/モーター<27%)
-   ・2号艇壁無し nr1>nr2 → nr1>nr2+0.3
-   ・攻め艇 A1/A2 or 6.0 → A1 or 6.3
-   ・攻め艇 ST ≤0.15 → ≤0.14
-   ・攻め艇モーター2連率 ≥33% 必須
-   ・1C−攻め艇 ST差 ≥0.02 必須
-   ・イン最強3場（徳山/大村/芦屋）を戦略対象外
-  【買い目最適化：回収率UP】
-   ・3C攻め: 9点 → 6点 (3-145-1456 → 3-45-1456)
-   ・4C攻め: 6点維持 (4-156-156)
-  【スコア精度UP】
-   ・ST差・モーター2連率を加点化、IN_ADJ場補正は撤廃
+v14.4 → v14.5 変更点:
+  【v14.3の条件にほぼ戻す】抽出が厳しすぎたため
+   ・1号艇勝率 < 5.4 (戻す)
+   ・致命傷 1つ以上 (戻す)
+   ・2号艇壁無し nr1 > nr2 (戻す、offset無し)
+   ・攻め艇 A1/A2 or 6.0 (戻す)
+   ・攻め艇 ST ≤ 0.15 (戻す)
+   ・ST差要件 撤廃
+  【残す改善点】
+   ・イン最強3場除外 (徳山・大村・芦屋) ← 戦略と根本的に不適合
+   ・攻め艇モーター2連率 ≥30% (緩めた)
+   ・3C攻め買い目: 9点 → 6点 (1号艇頭削除で低配当カット)
 """
 import streamlit as st
 import requests
@@ -27,7 +24,6 @@ import re
 from datetime import date, timedelta
 import time
 
-# ━━━━━━━━━━━ 定数 ━━━━━━━━━━━
 VENUES = {
     "01":"桐生","02":"戸田","03":"江戸川","04":"平和島","05":"多摩川",
     "06":"浜名湖","07":"蒲郡","08":"常滑","09":"津","10":"三国",
@@ -36,7 +32,6 @@ VENUES = {
     "21":"芦屋","22":"福岡","23":"唐津","24":"大村",
 }
 
-# イン最強場 → 1号艇確殺戦略の対象外
 EXCLUDED_VENUES = {"18", "24", "21"}  # 徳山、大村、芦屋
 
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"
@@ -47,7 +42,6 @@ COURSE_CSS = {
     4: "background:#1B6DB5;color:#FFF;",
 }
 
-# ━━━━━━━━━━━ 共通 ━━━━━━━━━━━
 @st.cache_data(ttl=180)
 def fetch(url):
     try:
@@ -92,7 +86,6 @@ def get_official_result(jcd, ds, rno):
         sanrentan = ""
         ranks = []
         payout_val = 0
-        
         for tr in soup.find_all('tr'):
             tds = tr.find_all('td')
             if len(tds) >= 3:
@@ -226,41 +219,11 @@ def parse_uchi_race(html, race_no):
         racers.append(r)
     return racers
 
-# ━━━━━━━━━━━ メイン解析ロジック v14.4 ━━━━━━━━━━━
+# ━━━━━━━━━━━ メイン解析ロジック v14.5 ━━━━━━━━━━━
 
 def get_eff_st(r):
     s = r.get("session_st", 0)
     return s if (s > 0 and s != 0.15) else r.get("avg_st", 0.15)
-
-def count_fatal(r1, st1):
-    """1号艇の致命傷をカウント。強致命傷は2つ分として扱う"""
-    reasons = []
-    is_strong = False
-    
-    # F数
-    f_count = r1.get("f_count", 0)
-    if f_count >= 2:
-        reasons.append("1C-F2")
-        is_strong = True
-    elif f_count == 1:
-        reasons.append("1C-F持")
-    
-    # ST
-    if st1 >= 0.19:
-        reasons.append("1C-ST激遅")
-        is_strong = True
-    elif st1 >= 0.17:
-        reasons.append("1C-ST遅")
-    
-    # モーター
-    m1 = r1.get("motor_2ren", 33.0)
-    if m1 < 27.0:
-        reasons.append("1C-機力最弱")
-        is_strong = True
-    elif m1 < 30.0:
-        reasons.append("1C-機力×")
-    
-    return reasons, is_strong
 
 def evaluate_all_patterns(racers, jcd):
     # イン最強場は除外
@@ -274,38 +237,30 @@ def evaluate_all_patterns(racers, jcd):
     m3 = r3.get("motor_2ren", 33.0)
     m4 = r4.get("motor_2ren", 33.0)
 
-    # ━━━ 【絶対条件】1号艇の致命傷 ＆ 2号艇壁無しチェック ━━━
-    # 1号艇が本当に弱いか
-    c1_weak = (nr1 < 5.2 and cl1 not in ["A1", "A2"])
-    # 2号艇も明確に弱い（+0.3差）
-    c2_no_wall = (nr1 > nr2 + 0.3)
+    # ━━━ 【絶対条件】v14.3と同じ ━━━
+    c1_weak = (nr1 < 5.4 and cl1 not in ["A1", "A2"])
+    c2_no_wall = (nr1 > nr2)
     
-    fatal_reasons, fatal_strong = count_fatal(r1, st1)
-    # 致命傷が2つ以上 or 強致命傷1つ以上
-    c_fatal = (len(fatal_reasons) >= 2) or fatal_strong
+    fatal_reasons = []
+    if r1.get("f_count", 0) >= 1: fatal_reasons.append("1C-F持")
+    if st1 >= 0.17: fatal_reasons.append("1C-ST遅")
+    if r1.get("motor_2ren", 33.0) < 30.0: fatal_reasons.append("1C-機力×")
 
-    # どれか一つでも満たしていない場合はスルー
-    if not c1_weak or not c_fatal or not c2_no_wall:
+    if not c1_weak or not fatal_reasons or not c2_no_wall:
         return None
 
     targets = []
 
     # ─── 3コース一撃まくり ───
-    if st2 >= st3:  # 2号艇のSTが壁にならない
-        c3_strong = (cl3 == "A1" or nr3 >= 6.3)
-        c3_st_ok = (st3 <= 0.14)
-        c3_st_gap = (st1 - st3 >= 0.02)
-        c3_motor = (m3 >= 33.0)
+    if st2 >= st3:
+        c3_strong = (cl3 in ["A1", "A2"] or nr3 >= 6.0)
+        c3_st_ok = (st3 <= 0.15)
+        c3_st_faster = (st3 < st1)
+        c3_motor_ok = (m3 >= 30.0)  # ★v14.5
         
-        if c3_strong and c3_st_ok and c3_st_gap and c3_motor:
-            # スコア: 攻め艇勝率 + 1号艇の弱さ + ST差 + モーター優位
-            score = (
-                nr3 
-                + (6.0 - nr1) * 2 
-                + (st1 - st3) * 15 
-                + max(0, (m3 - 33.0)) * 0.1
-            )
-            # 6点: 3-45-1456（1号艇頭を削除 → 回収率UP）
+        if c3_strong and c3_st_ok and c3_st_faster and c3_motor_ok:
+            score = nr3 + (6.0 - nr1) * 2
+            # ★v14.5: 9点 → 6点
             buy_patterns = [
                 [3,4,1], [3,4,5], [3,4,6],
                 [3,5,1], [3,5,4], [3,5,6],
@@ -319,21 +274,15 @@ def evaluate_all_patterns(racers, jcd):
             })
 
     # ─── 4コースカド一撃 ───
-    if nr3 < 5.3:  # 3号艇も壁にならない
-        c4_strong = (cl4 == "A1" or nr4 >= 6.3)
-        c4_st_ok = (st4 <= 0.14)
-        c4_st_gap = (st1 - st4 >= 0.03)
-        c4_inner_slow = (st3 >= st4 + 0.03)
-        c4_motor = (m4 >= 33.0)
+    if nr3 < 5.5:
+        c4_strong = (cl4 in ["A1", "A2"] or nr4 >= 6.0)
+        c4_st_ok = (st4 <= 0.15)
+        c4_inner_slow = (st3 >= st4 + 0.02)
+        c4_st_faster = (st4 < st1)
+        c4_motor_ok = (m4 >= 30.0)  # ★v14.5
         
-        if c4_strong and c4_st_ok and c4_st_gap and c4_inner_slow and c4_motor:
-            score = (
-                nr4 
-                + (6.0 - nr1) * 2 
-                + (st1 - st4) * 15 
-                + max(0, (m4 - 33.0)) * 0.1
-            )
-            # 6点: 4-156-156（的中率維持のため据え置き）
+        if c4_strong and c4_st_ok and c4_inner_slow and c4_st_faster and c4_motor_ok:
+            score = nr4 + (6.0 - nr1) * 2
             buy_patterns = [[4,5,1], [4,5,6], [4,1,5], [4,1,6], [4,6,1], [4,6,5]]
             targets.append({
                 "target": 4,
@@ -363,9 +312,8 @@ def daterange(start_date, end_date):
     for n in range(int((end_date - start_date).days) + 1):
         yield start_date + timedelta(n)
 
-# ━━━━━━━━━━━ UI ━━━━━━━━━━━
 def main():
-    st.set_page_config(page_title="🚤 1号艇確殺ハイエナ v14.4",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="🚤 1号艇確殺ハイエナ v14.5",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
     st.markdown("""<style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
     .stApp{background:linear-gradient(135deg,#0a0a1a,#0d1b2a 40%,#1b2838);font-family:'Noto Sans JP',sans-serif}
@@ -376,7 +324,7 @@ def main():
     .sl{font-size:12px;font-weight:700;color:#E8212A;letter-spacing:2px;margin-bottom:8px}
     </style>""",unsafe_allow_html=True)
     
-    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.4 ─ 条件厳格化＋買い目最適化（両立版）</div></div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.5 ─ v14.3ベース + 最小限改善</div></div></div>',unsafe_allow_html=True)
 
     st.markdown('<div class="card"><div class="sl">STEP 1 ─ 対象期間（最大31日）</div>',unsafe_allow_html=True)
     sel_dates = st.date_input("対象期間", value=(date.today(), date.today()), label_visibility="collapsed")
@@ -393,7 +341,7 @@ def main():
         
     st.markdown('</div>',unsafe_allow_html=True)
 
-    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.4）", type="primary", use_container_width=True):
+    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.5）", type="primary", use_container_width=True):
         date_list = list(daterange(s_date, e_date))
         total_days = len(date_list)
         
@@ -455,8 +403,6 @@ def main():
                             race_info["is_finished"] = True
                             race_info["result_str"] = res["sanrentan"]
                             finished_count += 1
-                            
-                            # 買い目点数分を加算
                             invested += len(race_info["buy_patterns"]) * 100
 
                             if res["ranks"] in race_info["buy_patterns"]:
@@ -489,7 +435,6 @@ def main():
         fin = st.session_state.get("search_finished", 0)
         roi = (ret / inv * 100) if inv > 0 else 0
         
-        # 的中数
         hit_count = sum(1 for m in matches if m["hit"])
         hit_rate = (hit_count / fin * 100) if fin > 0 else 0
 
