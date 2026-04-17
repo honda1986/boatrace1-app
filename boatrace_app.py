@@ -1,34 +1,21 @@
 """
-🚤 ボートレース予想アプリ v14.6 (v14.3ベース + ST強化版)
+🚤 ボートレース予想アプリ v14.7 (v14.3より緩く + 新データは加点のみ)
 ━━━━━━━━━━━━━━━━━━━━━━━━
-データソース: uchisankaku.sakura.ne.jp
-  ・選手情報（氏名・級別・体重・F数）
-  ・成績（全国勝率・2連率・3連率）
-  ★コース別／直近6ヶ月（ST・1着率・3連率）← 新規活用
-  ★決まり手（差され・捲られ・差し・捲り・捲り差し）← 新規活用
-  ・モーター2連率
-  ・今節成績（ST）
+データソース: uchisankaku.sakura.ne.jp / boatrace.jp
 
-v15.x (荒れ検出) 失敗の反省で v14.3 (1号艇確殺) に戻し、ST関連データで強化:
+v14.6 (0件抽出) の反省:
+  ・致命傷2つ以上必須で厳しすぎ
+  ・新規データをゲートに使って、パース失敗時に全件弾かれる
 
-【新規パース項目】
-  ・コース別ST (6ヶ月) ← これまでST取得が0.15デフォに落ちていた事実上のバグを解消
-  ・コース別1着率
-  ・1号艇の被逆転率 (差され + 捲られ)
-  ・攻め艇の攻撃率 (差し + 捲り + 捲り差し)
-  ・体重
-
-【get_eff_st 優先順】
-  session_st (今節) > course_st (6ヶ月コース別) > avg_st (全般) > 0.15
-
-【1号艇致命傷】(v14.3の3条件 + 新規3条件、2つ以上必須)
-  既存: F持ち / 平均ST≥0.17 / モーター<30%
-  新規: コース1の1着率<40% / 被逆転率≥40% / 体重≥56kg
-
-【攻め艇ゲート】(3C/4C、すべて必須)
-  既存: A1/A2 or 勝率≥6.0 / 有効ST≤0.15 / モーター≥30%
-  新規: コース別1着率≥15% (3C) / 12% (4C) — 実績保証
-  新規: 攻撃率 (差し+捲り+捲り差し) ≥10% — 攻め実績
+【v14.7 方針】
+  ① v14.3ベースに戻す + 「より緩く」
+     - 1号艇勝率 <5.4 → <5.6
+     - 致命傷 1つ以上 (v14.3と同じ)
+     - モーター致命傷 <30 → <32 (緩和)
+  ② 新データ(コース別ST/1着率/決まり手/体重)は【加点のみ】
+     - ゲートにしない → パース失敗しても0件にならない
+     - 取れた場合のみスコアに反映されて並び順に寄与
+  ③ get_eff_st だけコース別STを優先 (STの精度向上)
 """
 import streamlit as st
 import requests
@@ -44,8 +31,7 @@ VENUES = {
     "16":"児島","17":"宮島","18":"徳山","19":"下関","20":"若松",
     "21":"芦屋","22":"福岡","23":"唐津","24":"大村",
 }
-
-EXCLUDED_VENUES = {"18", "24", "21"}  # 徳山、大村、芦屋
+EXCLUDED_VENUES = {"18", "24", "21"}
 
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"
 HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"}
@@ -125,16 +111,13 @@ def get_uchi_data(jcd, ds):
     url = f"https://uchisankaku.sakura.ne.jp/racelist.php?jcode={jcode}&date={hd}"
     return fetch(url)
 
-# ━━━━━━━━━━━ ユーティリティ ━━━━━━━━━━━
-
 def _parse_float(s, default=0.0):
-    """数値文字列をfloatに。% や () や 'F' 等を除去"""
     if s is None: return default
-    s = str(s).replace("%", "").replace("F", "").replace("(", "").replace(")", "").replace("kg", "").strip()
+    s = str(s).replace("%","").replace("F","").replace("(","").replace(")","").replace("kg","").strip()
     m = re.match(r'^(\d+(?:\.\d+)?)$', s)
     return float(m.group(1)) if m else default
 
-# ━━━━━━━━━━━ パーサー (v14.6 強化版) ━━━━━━━━━━━
+# ━━━━━━━━━━━ パーサー v14.7 ━━━━━━━━━━━
 
 def parse_uchi_race(html, race_no):
     soup = BeautifulSoup(html, "html.parser")
@@ -148,7 +131,7 @@ def parse_uchi_race(html, race_no):
     if not tbl: return []
     rows = tbl.find_all("tr")
     
-    # ━━━ 基本row_map (v14.3互換) ━━━
+    # v14.3互換の row_map
     row_map = {}
     for tr in rows:
         cells = tr.find_all(["td","th"])
@@ -156,12 +139,9 @@ def parse_uchi_race(html, race_no):
         if len(texts) < 7: continue
         data6 = texts[-6:]
         label = ""
-        skip_words = ("選手情報","成績","コース別／直近６カ月","コース別／直近6カ月",
-                      "コース別/直近6カ月","決り手","決まり手","モーター","今節成績",
-                      "","枠","全国","当地")
         for t in texts[:-6]:
             t = t.replace("　"," ").strip()
-            if t and t not in skip_words:
+            if t and t not in ("選手情報","成績","コース別／直近６カ月","決り手","モーター","今節成績","","枠"):
                 label = t
                 break
         if not label and len(texts) > 7:
@@ -172,149 +152,146 @@ def parse_uchi_race(html, race_no):
                     break
         if label: row_map[label] = data6
     
-    # ━━━ セクション別データ (v14.6 新規) ━━━
-    # セクション内容を別途トラッキングして取得
-    section_data = {
-        "national": {},   # 全国成績
-        "course": {},     # コース別/6ヶ月
-        "kimarite": {},   # 決り手
-        "motor": {},      # モーター
-        "session": {},    # 今節成績
-    }
-    
-    current_section = "info"
+    # v14.7 新規: セクション別データ取得 (ベストエフォート、失敗しても OK)
+    section_data = {"course":{}, "kimarite":{}, "motor":{}, "session":{}, "national":{}, "local":{}}
+    current = "info"
     for tr in rows:
         cells = tr.find_all(["td","th"])
         texts = [c.get_text(strip=True) for c in cells]
         if not texts: continue
         joined = " ".join(texts)
         
-        # セクション遷移検出 (sticky)
-        if "全国" in joined and current_section in ("info", "national"):
-            current_section = "national"
+        if "全国" in joined and current in ("info","national"):
+            current = "national"
         elif "当地" in joined:
-            current_section = "local"
+            current = "local"
         elif "コース別" in joined:
-            current_section = "course"
-        elif "決り手" in joined or "決まり手" in joined:
-            current_section = "kimarite"
+            current = "course"
+        elif ("決り手" in joined) or ("決まり手" in joined):
+            current = "kimarite"
         elif "今節成績" in joined:
-            current_section = "session"
-        elif ("モーター" in joined or (texts[0] if texts else "").startswith("モ")) and current_section not in ("session",):
-            # モーターセクションの検出 (今節より前)
-            if current_section not in ("kimarite", "course"):
-                pass
-            current_section = "motor"
+            current = "session"
+        elif current == "kimarite" and ("モーター" in joined or texts[0].startswith("モ") or "ター" in joined):
+            current = "motor"
         
         if len(texts) < 7: continue
         data6 = texts[-6:]
-        
         label = ""
-        skip_words = ("選手情報","成績","コース別／直近６カ月","コース別／直近6カ月",
-                      "コース別/直近6カ月","決り手","決まり手","モーター","今節成績",
-                      "","枠","全国","当地")
         for t in texts[:-6]:
             t = t.replace("　"," ").strip()
-            if t and t not in skip_words:
+            if t and t not in ("選手情報","成績","コース別／直近６カ月","決り手","決まり手","モーター","今節成績","","枠","全国","当地"):
                 label = t
                 break
         if not label: continue
         
-        if current_section in section_data:
-            section_data[current_section][label] = data6
+        if current in section_data:
+            # Last write wins within section
+            section_data[current][label] = data6
     
-    # ━━━ 選手ごとのデータ組み立て ━━━
     racers = []
     for i in range(6):
         r = {"course": i+1}
-        
         def gv(label):
             return row_map.get(label, ["","","","","",""])[i].strip() if label in row_map else ""
-        
         def gs(section, label):
             d = section_data.get(section, {}).get(label)
             return d[i].strip() if d else ""
         
-        # ─── 基本情報 ───
+        # 基本情報 (v14.3互換)
         r["name"] = gv("氏名")
         r["class"] = gv("級別") or "B1"
         r["weight"] = _parse_float(gv("体重"), 52.0)
         
-        f_s = gv("F数").replace("F", "")
+        f_s = gv("F数").replace("F","")
         r["f_count"] = int(f_s) if f_s.isdigit() else 0
         
-        # ─── 全国勝率 (national優先、fallback で row_map) ───
-        nat_s = gs("national", "勝率")
-        if not nat_s or not re.match(r'^\d+\.\d+$', nat_s):
-            nat_s = gv("勝率")
-        r["national_rate"] = _parse_float(nat_s, 5.0)
-        
-        # ─── コース別ST (v14.6 新規: 最重要) ───
-        r["course_st"] = _parse_float(gs("course", "ST"), 0.0)
-        r["course_1st_rate"] = _parse_float(gs("course", "1着率"), 0.0)
-        r["course_3ren"] = _parse_float(gs("course", "3連率"), 0.0)
-        
-        # ─── 決まり手 (v14.6 新規) ───
-        if i == 0:
-            # 1号艇: 被逆転率 = 差され + 捲られ
-            sasare = _parse_float(gs("kimarite", "差され"), 0.0)
-            makurare = _parse_float(gs("kimarite", "捲られ"), 0.0)
-            r["sasare"] = sasare
-            r["makurare"] = makurare
-            r["defense_weak"] = sasare + makurare
-            r["attack_rate"] = 0.0
-        else:
-            # 2-6号艇: 攻撃率 = 差し + 捲り + 捲り差し
-            sashi = _parse_float(gs("kimarite", "差し"), 0.0)
-            makuri = _parse_float(gs("kimarite", "捲り"), 0.0)
-            makuri_zashi = _parse_float(gs("kimarite", "捲り差し"), 0.0)
-            r["sashi"] = sashi
-            r["makuri"] = makuri
-            r["makuri_zashi"] = makuri_zashi
-            r["attack_rate"] = sashi + makuri + makuri_zashi
-            r["defense_weak"] = 0.0
-        
-        # ─── モーター ───
-        mv = _parse_float(gs("motor", "2連率"), 0.0)
-        if mv <= 0:
-            # fallback: old in_motor loop style
-            mv = 33.0
-            in_motor = False
+        # 全国勝率
+        nat_rate = _parse_float(gs("national","勝率"), 0.0)
+        if nat_rate == 0:
+            # fallback: v14.3式 再ループ
+            in_national = False
             for tr in rows:
                 cells = tr.find_all(["td","th"])
                 texts2 = [c.get_text(strip=True) for c in cells]
                 joined = " ".join(texts2)
-                if "モーター" in joined or "ター" in joined: in_motor = True
-                elif "今節成績" in joined: in_motor = False
-                if in_motor and len(texts2) >= 7:
+                if "全国" in joined: in_national = True
+                elif "当地" in joined or "コース別" in joined: in_national = False
+                if len(texts2) >= 7:
                     data = texts2[-6:]
                     label2 = " ".join(texts2[:-6]).strip()
-                    if "2連率" in label2:
+                    if "勝率" in label2:
                         val = data[i]
-                        if re.match(r'^[\d.]+$', val) and float(val) > 0:
-                            mv = float(val)
-                            break
-        r["motor_2ren"] = mv if mv > 0 else 33.0
+                        if re.match(r'^\d+\.\d+$', val):
+                            if in_national and nat_rate == 0:
+                                nat_rate = float(val)
+            if nat_rate == 0:
+                nr_s = gv("勝率")
+                if re.match(r'^\d+\.\d+$', nr_s): nat_rate = float(nr_s)
+        r["national_rate"] = nat_rate if nat_rate > 0 else 5.0
         
-        # ─── ST (fallback chain) ───
-        # 平均ST (row_map["ST"] = 最後の"ST"ラベル行、= 今節ST行のことが多い)
+        # コース別ST / 1着率 (新規、取れたら使う)
+        r["course_st"] = _parse_float(gs("course","ST"), 0.0)
+        r["course_1st_rate"] = _parse_float(gs("course","1着率"), 0.0)
+        
+        # 決まり手 (新規、取れたら使う)
+        if i == 0:
+            r["defense_weak"] = _parse_float(gs("kimarite","差され"),0.0) + _parse_float(gs("kimarite","捲られ"),0.0)
+            r["attack_rate"] = 0.0
+        else:
+            r["defense_weak"] = 0.0
+            r["attack_rate"] = (
+                _parse_float(gs("kimarite","差し"),0.0)
+                + _parse_float(gs("kimarite","捲り"),0.0)
+                + _parse_float(gs("kimarite","捲り差し"),0.0)
+            )
+        
+        # モーター (v14.3式 fallback込み)
+        in_motor = False
+        motor_2ren = 33.0
+        for tr in rows:
+            cells = tr.find_all(["td","th"])
+            texts2 = [c.get_text(strip=True) for c in cells]
+            joined = " ".join(texts2)
+            if "モーター" in joined or "ター" in joined: in_motor = True
+            elif "今節成績" in joined: in_motor = False
+            if in_motor and len(texts2) >= 7:
+                data = texts2[-6:]
+                label2 = " ".join(texts2[:-6]).strip()
+                if "2連率" in label2:
+                    val = data[i]
+                    if re.match(r'^[\d.]+$', val) and float(val) > 0:
+                        motor_2ren = float(val)
+                        break
+        r["motor_2ren"] = motor_2ren
+        
+        # ST (v14.3式)
         st_s = gv("ST")
-        r["avg_st"] = _parse_float(st_s, 0.0)
-        if r["avg_st"] <= 0:
-            # コース別STを平均STとしても使う
-            r["avg_st"] = r["course_st"] if r["course_st"] > 0 else 0.15
+        r["avg_st"] = float(st_s) if re.match(r'^0\.\d+$', st_s) else 0.15
         
         # 今節ST
-        r["session_st"] = _parse_float(gs("session", "ST"), 0.0)
+        in_session = False
+        session_st = 0.15
+        for tr in rows:
+            cells = tr.find_all(["td","th"])
+            texts2 = [c.get_text(strip=True) for c in cells]
+            joined = " ".join(texts2)
+            if "今節成績" in joined: in_session = True
+            elif in_session and len(texts2) >= 7:
+                data = texts2[-6:]
+                label2 = " ".join(texts2[:-6]).strip()
+                val = data[i]
+                if not val or val == "-": continue
+                if "ST" in label2 and re.match(r'^[\d.]+$', val): 
+                    session_st = float(val)
+        r["session_st"] = session_st
         
         racers.append(r)
-    
     return racers
 
-# ━━━━━━━━━━━ メイン解析ロジック v14.6 ━━━━━━━━━━━
+# ━━━━━━━━━━━ メイン解析ロジック v14.7 ━━━━━━━━━━━
 
 def get_eff_st(r):
-    """ST の優先度: 今節 > コース別6ヶ月 > 平均 > 0.15"""
+    """優先度: 今節 > コース別6ヶ月 > 平均 > 0.15"""
     s = r.get("session_st", 0)
     if s > 0 and s != 0.15:
         return s
@@ -333,63 +310,52 @@ def evaluate_all_patterns(racers, jcd):
     cl1, cl2, cl3, cl4, cl5, cl6 = [r.get("class", "B1") for r in racers]
     m3 = r3.get("motor_2ren", 33.0)
     m4 = r4.get("motor_2ren", 33.0)
-
-    # ━━━ 【絶対条件】1号艇勝率弱 ＋ 2号艇壁無し ━━━
-    c1_weak = (nr1 < 5.4 and cl1 not in ["A1", "A2"])
+    
+    # ━━━ 【絶対条件】v14.3より緩く ━━━
+    c1_weak = (nr1 < 5.6 and cl1 not in ["A1"])  # 5.4→5.6、A1のみ除外 (A2はOK)
     c2_no_wall = (nr1 > nr2)
     
-    if not c1_weak or not c2_no_wall:
-        return None
-    
-    # ━━━ 1号艇致命傷 (2つ以上必須) ━━━
+    # ━━━ 致命傷 (1つ以上必須、候補6種類に拡張) ━━━
     fatal_reasons = []
-    
-    # 既存条件
-    if r1.get("f_count", 0) >= 1: fatal_reasons.append("F持")
-    if st1 >= 0.17: fatal_reasons.append(f"ST{st1:.2f}")
-    if r1.get("motor_2ren", 33.0) < 30.0: fatal_reasons.append("機×")
-    
-    # v14.6 新規: コース1の1着率
+    # v14.3既存 (モーター条件は <30→<32 緩和)
+    if r1.get("f_count", 0) >= 1: fatal_reasons.append("1C-F持")
+    if st1 >= 0.17: fatal_reasons.append(f"1C-ST{st1:.2f}")
+    if r1.get("motor_2ren", 33.0) < 32.0: fatal_reasons.append("1C-機力×")
+    # v14.7 新規 (取れたら評価、取れなければスキップ)
     c1_1st = r1.get("course_1st_rate", 0.0)
     if 0 < c1_1st < 40.0:
         fatal_reasons.append(f"1着{c1_1st:.0f}%")
-    
-    # v14.6 新規: 被逆転率
     def_weak = r1.get("defense_weak", 0.0)
     if def_weak >= 40.0:
-        fatal_reasons.append(f"被逆転{def_weak:.0f}%")
-    
-    # v14.6 新規: 重量
+        fatal_reasons.append(f"被逆{def_weak:.0f}%")
     w1 = r1.get("weight", 52.0)
     if w1 >= 56.0:
         fatal_reasons.append(f"{w1:.0f}kg")
     
-    # 致命傷 2つ以上必須 (or 被逆転50%以上の超致命傷1つ)
-    strong_fatal = def_weak >= 50.0 or (0 < c1_1st < 25.0)
-    if len(fatal_reasons) < 2 and not strong_fatal:
+    if not c1_weak or not c2_no_wall or not fatal_reasons:
         return None
     
     targets = []
-
-    # ━━━ 3コース一撃まくり ━━━
-    if st2 >= st3:  # 2号艇壁にならず
+    
+    # ━━━ 3コース一撃まくり (v14.3 + 加点) ━━━
+    if st2 >= st3:
         c3_strong = (cl3 in ["A1", "A2"] or nr3 >= 6.0)
         c3_st_ok = (st3 <= 0.15)
         c3_st_faster = (st3 < st1)
-        c3_motor_ok = (m3 >= 30.0)
-        # v14.6 新規ゲート
-        c3_1st_rate = r3.get("course_1st_rate", 0.0)
-        c3_course_ok = (c3_1st_rate >= 15.0)
-        c3_attack = r3.get("attack_rate", 0.0)
-        c3_attack_ok = (c3_attack >= 10.0)
         
-        if (c3_strong and c3_st_ok and c3_st_faster and c3_motor_ok 
-            and c3_course_ok and c3_attack_ok):
-            # スコア: 基本 + 新規因子
+        if c3_strong and c3_st_ok and c3_st_faster:
             score = nr3 + (6.0 - nr1) * 2
-            score += c3_1st_rate * 0.05        # コース実績
-            score += c3_attack * 0.08          # 攻め力
-            score += max(0, def_weak - 30) * 0.05  # 1号艇守備脆弱
+            # v14.7 加点 (取れた場合のみ寄与)
+            c3_1st_rate = r3.get("course_1st_rate", 0.0)
+            c3_attack = r3.get("attack_rate", 0.0)
+            score += c3_1st_rate * 0.05
+            score += c3_attack * 0.08
+            score += max(0, def_weak - 30) * 0.05
+            score += max(0, w1 - 53) * 0.3
+            
+            extra_reasons = []
+            if c3_1st_rate > 0: extra_reasons.append(f"3C1着{c3_1st_rate:.0f}")
+            if c3_attack > 0: extra_reasons.append(f"攻{c3_attack:.0f}")
             
             buy_patterns = [
                 [3,4,1], [3,4,5], [3,4,6],
@@ -398,45 +364,45 @@ def evaluate_all_patterns(racers, jcd):
             targets.append({
                 "target": 3,
                 "score": score,
-                "reasons": fatal_reasons + [f"3C1着{c3_1st_rate:.0f}", f"攻{c3_attack:.0f}%"],
+                "reasons": fatal_reasons + ["2C壁無", "3C強攻"] + extra_reasons,
                 "pred_str": "3-45-1456 (6点)",
                 "buy_patterns": buy_patterns
             })
-
-    # ━━━ 4コースカド一撃 ━━━
-    if nr3 < 5.5:  # 3号艇壁にならず
+    
+    # ━━━ 4コースカド一撃 (v14.3 + 加点) ━━━
+    if nr3 < 5.5:
         c4_strong = (cl4 in ["A1", "A2"] or nr4 >= 6.0)
         c4_st_ok = (st4 <= 0.15)
         c4_inner_slow = (st3 >= st4 + 0.02)
         c4_st_faster = (st4 < st1)
-        c4_motor_ok = (m4 >= 30.0)
-        # v14.6 新規ゲート
-        c4_1st_rate = r4.get("course_1st_rate", 0.0)
-        c4_course_ok = (c4_1st_rate >= 12.0)
-        c4_attack = r4.get("attack_rate", 0.0)
-        c4_attack_ok = (c4_attack >= 10.0)
         
-        if (c4_strong and c4_st_ok and c4_inner_slow and c4_st_faster 
-            and c4_motor_ok and c4_course_ok and c4_attack_ok):
+        if c4_strong and c4_st_ok and c4_inner_slow and c4_st_faster:
             score = nr4 + (6.0 - nr1) * 2
+            c4_1st_rate = r4.get("course_1st_rate", 0.0)
+            c4_attack = r4.get("attack_rate", 0.0)
             score += c4_1st_rate * 0.05
             score += c4_attack * 0.08
             score += max(0, def_weak - 30) * 0.05
+            score += max(0, w1 - 53) * 0.3
+            
+            extra_reasons = []
+            if c4_1st_rate > 0: extra_reasons.append(f"4C1着{c4_1st_rate:.0f}")
+            if c4_attack > 0: extra_reasons.append(f"攻{c4_attack:.0f}")
             
             buy_patterns = [[4,5,1], [4,5,6], [4,1,5], [4,1,6], [4,6,1], [4,6,5]]
             targets.append({
                 "target": 4,
                 "score": score,
-                "reasons": fatal_reasons + [f"4C1着{c4_1st_rate:.0f}", f"攻{c4_attack:.0f}%"],
+                "reasons": fatal_reasons + ["内枠総崩", "4C先行"] + extra_reasons,
                 "pred_str": "4-156-156 (6点)",
                 "buy_patterns": buy_patterns
             })
-
+    
     if not targets: return None
-
+    
     best = max(targets, key=lambda x: x["score"])
     stars = "★★★" if best["score"] >= 9.0 else "★★☆" if best["score"] >= 7.0 else "★☆☆"
-
+    
     return {
         "target": best["target"],
         "score": round(best["score"], 1),
@@ -454,7 +420,7 @@ def daterange(start_date, end_date):
 
 # ━━━━━━━━━━━ UI ━━━━━━━━━━━
 def main():
-    st.set_page_config(page_title="🚤 確殺ハイエナ v14.6",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="🚤 確殺ハイエナ v14.7",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
     st.markdown("""<style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
     .stApp{background:linear-gradient(135deg,#0a0a1a,#0d1b2a 40%,#1b2838);font-family:'Noto Sans JP',sans-serif}
@@ -465,7 +431,7 @@ def main():
     .sl{font-size:12px;font-weight:700;color:#E8212A;letter-spacing:2px;margin-bottom:8px}
     </style>""",unsafe_allow_html=True)
     
-    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.6 ─ v14.3ベース + ST/決まり手/体重 強化版</div></div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.7 ─ v14.3より緩く + 新データは加点のみ</div></div></div>',unsafe_allow_html=True)
 
     st.markdown('<div class="card"><div class="sl">STEP 1 ─ 対象期間（最大31日）</div>',unsafe_allow_html=True)
     sel_dates = st.date_input("対象期間", value=(date.today(), date.today()), label_visibility="collapsed")
@@ -482,7 +448,7 @@ def main():
         
     st.markdown('</div>',unsafe_allow_html=True)
 
-    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.6）", type="primary", use_container_width=True):
+    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.7）", type="primary", use_container_width=True):
         date_list = list(daterange(s_date, e_date))
         total_days = len(date_list)
         
