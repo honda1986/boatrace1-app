@@ -1,26 +1,27 @@
 """
-🚤 ボートレース予想アプリ v14.5 (v14.3ベース + 最小限改善)
+🚤 ボートレース予想アプリ v15.0 (戦略転換 / 荒れレース検出+3連単BOX)
 ━━━━━━━━━━━━━━━━━━━━━━━━
 データソース: uchisankaku.sakura.ne.jp（コース別・節間・全選手データ・決まり手）
              boatrace.jp（開催場一覧・直前情報・レース結果）
 
-v14.4 → v14.5 変更点:
-  【v14.3の条件にほぼ戻す】抽出が厳しすぎたため
-   ・1号艇勝率 < 5.4 (戻す)
-   ・致命傷 1つ以上 (戻す)
-   ・2号艇壁無し nr1 > nr2 (戻す、offset無し)
-   ・攻め艇 A1/A2 or 6.0 (戻す)
-   ・攻め艇 ST ≤ 0.15 (戻す)
-   ・ST差要件 撤廃
-  【残す改善点】
-   ・イン最強3場除外 (徳山・大村・芦屋) ← 戦略と根本的に不適合
-   ・攻め艇モーター2連率 ≥30% (緩めた)
-   ・3C攻め買い目: 9点 → 6点 (1号艇頭削除で低配当カット)
+v14.x → v15.0 完全戦略転換:
+  【旧】1号艇確殺ハイエナ → 19件中的中2件・回収率42.5%で失敗
+  【新】荒れレース検出 → 上位3艇の3連単BOX(6点/600円)
+
+検出条件:
+  ・A1/A2が2艇以上（強豪分散）
+  ・上位3艇のスコア差が小さい（max-min ≤ 3.0）
+  ・1号艇が圧倒的でない（1C最上位でもスコア差<2.0）
+  ・除外場: 徳山・大村・芦屋（イン最強で荒れにくい）
+
+スコアリング:
+  勝率×1.0 + ST加点 + モーター加点 + クラス加点 + コース補正 + F減点
 """
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import re
+import itertools
 from datetime import date, timedelta
 import time
 
@@ -36,11 +37,6 @@ EXCLUDED_VENUES = {"18", "24", "21"}  # 徳山、大村、芦屋
 
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"
 HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"}
-
-COURSE_CSS = {
-    3: "background:#E8212A;color:#FFF;",
-    4: "background:#1B6DB5;color:#FFF;",
-}
 
 @st.cache_data(ttl=180)
 def fetch(url):
@@ -219,112 +215,137 @@ def parse_uchi_race(html, race_no):
         racers.append(r)
     return racers
 
-# ━━━━━━━━━━━ メイン解析ロジック v14.5 ━━━━━━━━━━━
+# ━━━━━━━━━━━ v15.0 新戦略: 荒れレース検出 ━━━━━━━━━━━
+
+COURSE_BOOST = {1: 3.0, 2: 1.5, 3: 1.0, 4: 0.5, 5: 0.0, 6: -0.5}
+CLASS_BOOST = {"A1": 2.0, "A2": 1.0, "B1": 0.0, "B2": -1.0}
 
 def get_eff_st(r):
     s = r.get("session_st", 0)
     return s if (s > 0 and s != 0.15) else r.get("avg_st", 0.15)
 
-def evaluate_all_patterns(racers, jcd):
+def calculate_boat_score(r):
+    """全艇共通のスコアリング"""
+    course = r["course"]
+    nr = r.get("national_rate", 5.0)
+    st = get_eff_st(r)
+    motor = r.get("motor_2ren", 33.0)
+    cl = r.get("class", "B1")
+    f_count = r.get("f_count", 0)
+    
+    score = 0.0
+    score += nr * 1.0
+    score += max(0, (0.20 - st) * 20)
+    score += max(0, (motor - 33) * 0.05)
+    score += CLASS_BOOST.get(cl, 0.0)
+    score += COURSE_BOOST.get(course, 0.0)
+    if f_count >= 2:
+        score -= 2.0
+    elif f_count == 1:
+        score -= 1.0
+    
+    return round(score, 2)
+
+def evaluate_chaos_race(racers, jcd):
     # イン最強場は除外
     if jcd in EXCLUDED_VENUES:
         return None
     
-    r1, r2, r3, r4, r5, r6 = racers
-    st1, st2, st3, st4, st5, st6 = [get_eff_st(r) for r in racers]
-    nr1, nr2, nr3, nr4, nr5, nr6 = [r.get("national_rate", 5.0) for r in racers]
-    cl1, cl2, cl3, cl4, cl5, cl6 = [r.get("class", "B1") for r in racers]
-    m3 = r3.get("motor_2ren", 33.0)
-    m4 = r4.get("motor_2ren", 33.0)
-
-    # ━━━ 【絶対条件】v14.3と同じ ━━━
-    c1_weak = (nr1 < 5.4 and cl1 not in ["A1", "A2"])
-    c2_no_wall = (nr1 > nr2)
+    # 全艇スコアリング
+    scored = [(r["course"], calculate_boat_score(r), r) for r in racers]
+    scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
     
-    fatal_reasons = []
-    if r1.get("f_count", 0) >= 1: fatal_reasons.append("1C-F持")
-    if st1 >= 0.17: fatal_reasons.append("1C-ST遅")
-    if r1.get("motor_2ren", 33.0) < 30.0: fatal_reasons.append("1C-機力×")
-
-    if not c1_weak or not fatal_reasons or not c2_no_wall:
+    top3 = scored_sorted[:3]
+    top3_courses = [c for c, _, _ in top3]
+    top3_scores = [s for _, s, _ in top3]
+    
+    # ━━━ 混戦条件 ━━━
+    # 1. 上位3艇のスコア差 ≤ 3.0
+    score_spread = top3_scores[0] - top3_scores[2]
+    if score_spread > 3.0:
+        return None  # 実力差あり → 堅い決着 → 荒れない
+    
+    # 2. 1号艇が圧倒的じゃない
+    score_by_course = {c: s for c, s, _ in scored}
+    max_score = top3_scores[0]
+    s1 = score_by_course.get(1, 0)
+    # 1号艇が最高スコアの場合、2位との差が2.0以上なら堅い
+    if top3_courses[0] == 1 and (top3_scores[0] - top3_scores[1]) > 2.0:
         return None
-
-    targets = []
-
-    # ─── 3コース一撃まくり ───
-    if st2 >= st3:
-        c3_strong = (cl3 in ["A1", "A2"] or nr3 >= 6.0)
-        c3_st_ok = (st3 <= 0.15)
-        c3_st_faster = (st3 < st1)
-        c3_motor_ok = (m3 >= 30.0)  # ★v14.5
-        
-        if c3_strong and c3_st_ok and c3_st_faster and c3_motor_ok:
-            score = nr3 + (6.0 - nr1) * 2
-            # ★v14.5: 9点 → 6点
-            buy_patterns = [
-                [3,4,1], [3,4,5], [3,4,6],
-                [3,5,1], [3,5,4], [3,5,6],
-            ]
-            targets.append({
-                "target": 3,
-                "score": score,
-                "reasons": fatal_reasons + ["2C壁無", "3C強攻"],
-                "pred_str": "3-45-1456 (6点)",
-                "buy_patterns": buy_patterns
-            })
-
-    # ─── 4コースカド一撃 ───
-    if nr3 < 5.5:
-        c4_strong = (cl4 in ["A1", "A2"] or nr4 >= 6.0)
-        c4_st_ok = (st4 <= 0.15)
-        c4_inner_slow = (st3 >= st4 + 0.02)
-        c4_st_faster = (st4 < st1)
-        c4_motor_ok = (m4 >= 30.0)  # ★v14.5
-        
-        if c4_strong and c4_st_ok and c4_inner_slow and c4_st_faster and c4_motor_ok:
-            score = nr4 + (6.0 - nr1) * 2
-            buy_patterns = [[4,5,1], [4,5,6], [4,1,5], [4,1,6], [4,6,1], [4,6,5]]
-            targets.append({
-                "target": 4,
-                "score": score,
-                "reasons": fatal_reasons + ["内枠総崩", "4C先行"],
-                "pred_str": "4-156-156 (6点)",
-                "buy_patterns": buy_patterns
-            })
-
-    if not targets: return None
-
-    best = max(targets, key=lambda x: x["score"])
-    stars = "★★★" if best["score"] >= 8.0 else "★★☆"
-
+    
+    # 3. A1/A2が2艇以上（強豪分散）
+    classes = [r.get("class", "B1") for r in racers]
+    a_count = sum(1 for c in classes if c in ["A1", "A2"])
+    if a_count < 2:
+        return None
+    
+    # 4. 最低実力ライン（全員B2だと荒れすぎて予想不能）
+    avg_rate = sum(r.get("national_rate", 5.0) for r in racers) / 6
+    if avg_rate < 4.5:
+        return None
+    
+    # 混戦スコア（高いほど良い抽出候補）
+    chaos_score = (
+        (3.0 - score_spread)  # スコア差が小さいほど+
+        + a_count * 0.5        # A級密度
+        + (avg_rate - 4.5)     # 全体レベル
+    )
+    
+    # 上位3艇の3連単BOX
+    top3_sorted_nums = sorted(top3_courses)
+    buy_patterns = [list(p) for p in itertools.permutations(top3_sorted_nums, 3)]
+    pred_str = f"{top3_sorted_nums[0]}={top3_sorted_nums[1]}={top3_sorted_nums[2]} 3連単BOX (6点)"
+    
+    # 3連複BOX（参考）
+    sanrenpuku_str = f"{top3_sorted_nums[0]}={top3_sorted_nums[1]}={top3_sorted_nums[2]} (1点)"
+    
+    stars = "★★★" if chaos_score >= 3.5 else "★★☆" if chaos_score >= 2.0 else "★☆☆"
+    
+    # 理由タグ
+    reasons = [
+        f"A級{a_count}艇",
+        f"上位差{score_spread:.1f}",
+        f"平均{avg_rate:.1f}",
+    ]
+    if 1 in top3_sorted_nums:
+        reasons.append("1C含む")
+    else:
+        reasons.append("1C圏外")
+    
+    # 全艇スコア表示用
+    all_scores = sorted(scored, key=lambda x: x[0])
+    score_info = " ".join(f"{c}C({s:.1f})" for c, s, _ in all_scores)
+    
     return {
-        "target": best["target"],
-        "score": round(best["score"], 1),
+        "top3_courses": top3_sorted_nums,
+        "score": round(chaos_score, 2),
         "stars": stars,
-        "reasons": best["reasons"],
-        "st_info": f"1C({st1:.2f}) 2C({st2:.2f}) 3C({st3:.2f}) 4C({st4:.2f}) 5C({st5:.2f})",
-        "pw_info": f"1C({nr1:.1f}) 2C({nr2:.1f}) 3C({nr3:.1f}) 4C({nr4:.1f}) 5C({nr5:.1f})",
-        "pred_str": best["pred_str"],
-        "buy_patterns": best["buy_patterns"]
+        "reasons": reasons,
+        "score_info": score_info,
+        "pw_info": " ".join(f"{r['course']}C({r.get('national_rate',5.0):.1f}{r.get('class','B1')})" for r in racers),
+        "pred_str": pred_str,
+        "sanrenpuku_str": sanrenpuku_str,
+        "buy_patterns": buy_patterns,
     }
 
 def daterange(start_date, end_date):
     for n in range(int((end_date - start_date).days) + 1):
         yield start_date + timedelta(n)
 
+# ━━━━━━━━━━━ UI ━━━━━━━━━━━
 def main():
-    st.set_page_config(page_title="🚤 1号艇確殺ハイエナ v14.5",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="🚤 荒れレース・ハンター v15.0",page_icon="🌊",layout="wide",initial_sidebar_state="collapsed")
     st.markdown("""<style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
     .stApp{background:linear-gradient(135deg,#0a0a1a,#0d1b2a 40%,#1b2838);font-family:'Noto Sans JP',sans-serif}
-    .hdr{background:linear-gradient(90deg,#E8212A,#B71C1C);padding:16px 24px;border-radius:12px;display:flex;align-items:center;gap:14px;box-shadow:0 4px 20px rgba(232,33,42,0.35);margin-bottom:16px}
+    .hdr{background:linear-gradient(90deg,#1B6DB5,#0D47A1);padding:16px 24px;border-radius:12px;display:flex;align-items:center;gap:14px;box-shadow:0 4px 20px rgba(27,109,181,0.35);margin-bottom:16px}
     .hdr h1{color:#FFF!important;font-size:22px!important;font-weight:900!important;letter-spacing:3px;margin:0!important;padding:0!important}
-    .hdr .sub{color:#ffcdd2;font-size:11px;letter-spacing:1px}
+    .hdr .sub{color:#BBDEFB;font-size:11px;letter-spacing:1px}
     .card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:16px;margin-bottom:12px}
-    .sl{font-size:12px;font-weight:700;color:#E8212A;letter-spacing:2px;margin-bottom:8px}
+    .sl{font-size:12px;font-weight:700;color:#1B6DB5;letter-spacing:2px;margin-bottom:8px}
     </style>""",unsafe_allow_html=True)
     
-    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.5 ─ v14.3ベース + 最小限改善</div></div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hdr"><span style="font-size:32px">🌊</span><div><h1>BOAT RACE AI</h1><div class="sub">v15.0 ─ 荒れレース検出 × 上位3艇3連単BOX</div></div></div>',unsafe_allow_html=True)
 
     st.markdown('<div class="card"><div class="sl">STEP 1 ─ 対象期間（最大31日）</div>',unsafe_allow_html=True)
     sel_dates = st.date_input("対象期間", value=(date.today(), date.today()), label_visibility="collapsed")
@@ -341,7 +362,7 @@ def main():
         
     st.markdown('</div>',unsafe_allow_html=True)
 
-    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.5）", type="primary", use_container_width=True):
+    if st.button(f"🌊 指定期間をまとめて解析（荒れハンター v15.0）", type="primary", use_container_width=True):
         date_list = list(daterange(s_date, e_date))
         total_days = len(date_list)
         
@@ -377,17 +398,18 @@ def main():
                         racers = parse_uchi_race(html, rno)
                         if len(racers) < 6: continue
 
-                        ev = evaluate_all_patterns(racers, jcd)
+                        ev = evaluate_chaos_race(racers, jcd)
                         if not ev: continue
                         
                         race_info = {
                             "date": ds,
                             "jcd": jcd, "name": v["name"], "rno": rno,
                             "time": rtimes.get(rno, "--:--"),
-                            "target": ev["target"],
+                            "top3_courses": ev["top3_courses"],
                             "pred_str": ev["pred_str"],
+                            "sanrenpuku_str": ev["sanrenpuku_str"],
                             "buy_patterns": ev["buy_patterns"],
-                            "st_info": ev["st_info"],
+                            "score_info": ev["score_info"],
                             "pw_info": ev["pw_info"],
                             "score": ev["score"],
                             "stars": ev["stars"],
@@ -438,12 +460,12 @@ def main():
         hit_count = sum(1 for m in matches if m["hit"])
         hit_rate = (hit_count / fin * 100) if fin > 0 else 0
 
-        st.markdown('<div style="background:rgba(232, 33, 42, 0.1); padding:16px; border-radius:12px; border:1px solid #E8212A; margin-bottom:16px;">', unsafe_allow_html=True)
+        st.markdown('<div style="background:rgba(27, 109, 181, 0.1); padding:16px; border-radius:12px; border:1px solid #1B6DB5; margin-bottom:16px;">', unsafe_allow_html=True)
         date_range_str = f"{s_date.strftime('%m/%d')} 〜 {e_date.strftime('%m/%d')}" if s_date != e_date else f"{s_date.strftime('%m/%d')}"
-        st.markdown(f"<h3 style='margin-bottom:4px;'>🎯 ハイエナ予想一覧 ({date_range_str}): 計 {len(matches)} 件</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='margin-bottom:4px;'>🌊 荒れレース一覧 ({date_range_str}): 計 {len(matches)} 件</h3>", unsafe_allow_html=True)
         
-        roi_color = "#2D8C3C" if roi >= 100 else "#E8212A" if roi > 0 else "#fff"
-        hit_color = "#2D8C3C" if hit_rate >= 20 else "#F5C518" if hit_rate >= 10 else "#E8212A"
+        roi_color = "#2D8C3C" if roi >= 100 else "#F5C518" if roi >= 80 else "#E8212A"
+        hit_color = "#2D8C3C" if hit_rate >= 20 else "#F5C518" if hit_rate >= 15 else "#E8212A"
 
         dash_html = (
             f"<div style='display:flex; justify-content:space-around; background:rgba(0,0,0,0.3); padding:16px; border-radius:8px; margin-top:12px; margin-bottom:20px; border:1px solid rgba(255,255,255,0.1); flex-wrap:wrap; gap:8px;'>"
@@ -461,37 +483,36 @@ def main():
                 bg_color = "rgba(45, 140, 60, 0.2)" if m["hit"] else "rgba(255,255,255,0.03)"
                 border_s = "border:1px solid #2D8C3C;" if m["hit"] else "border:1px solid rgba(255,255,255,0.1);"
                 hit_badge = "<span style='background:#2D8C3C; color:#fff; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:bold;'>的中🎯</span>" if m["hit"] else ""
-                miss_1c = ""
+                miss_badge = ""
                 if m["is_finished"] and not m["hit"]:
-                    miss_1c = "<span style='background:#E8212A; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px;'>不的中</span>"
+                    miss_badge = "<span style='background:#E8212A; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px;'>不的中</span>"
 
-                sc_color = "#F5C518" if m["score"] >= 8.0 else "#E8212A"
+                sc_color = "#F5C518" if m["score"] >= 3.5 else "#1B6DB5"
 
                 reason_tags = " ".join(
                     f"<span style='background:rgba(255,255,255,0.08);padding:1px 6px;border-radius:3px;font-size:11px;color:#ccc;margin-right:4px;'>{r}</span>"
                     for r in m["reasons"]
                 )
 
-                tgt = m["target"]
-                badge_css = COURSE_CSS.get(tgt, "background:#999;color:#fff;")
-                tgt_badge = f"<span style='{badge_css} padding:3px 8px; border-radius:4px; font-weight:bold; font-size:13px; margin-right:8px;'>{tgt}アタマ</span>"
+                top3 = m["top3_courses"]
+                top3_badge = f"<span style='background:#1B6DB5;color:#fff; padding:3px 8px; border-radius:4px; font-weight:bold; font-size:13px; margin-right:8px;'>{'='.join(map(str,top3))} BOX</span>"
                 
                 race_date_str = m['date'][5:].replace("-", "/")
 
                 card_html = (
                     f"<div style='background:{bg_color}; padding:12px 16px; border-radius:8px; {border_s} margin-bottom:10px;'>"
                     f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>"
-                    f"<div>{tgt_badge}<span style='color:#E8212A;font-weight:bold;font-size:16px;'>[{race_date_str}] {m['name']} {m['rno']}R</span>"
+                    f"<div>{top3_badge}<span style='color:#1B6DB5;font-weight:bold;font-size:16px;'>[{race_date_str}] {m['name']} {m['rno']}R</span>"
                     f"<span style='color:#ccc; font-size:13px; margin-left:8px;'>🕒 {m['time']}</span></div>"
                     f"<div style='display:flex;align-items:center;gap:8px;'>"
                     f"<span style='color:{sc_color};font-weight:900;font-size:18px;'>{m['stars']}</span>"
-                    f"{hit_badge}{miss_1c}</div></div>"
-                    f"<div style='font-size:11px; color:#888; margin-bottom:2px;'>ST : {m['st_info']}</div>"
+                    f"{hit_badge}{miss_badge}</div></div>"
+                    f"<div style='font-size:11px; color:#888; margin-bottom:2px;'>Score: {m['score_info']}</div>"
                     f"<div style='font-size:11px; color:#888; margin-bottom:4px;'>勝率: {m['pw_info']}</div>"
                     f"<div style='margin-bottom:6px;'>{reason_tags}</div>"
                     f"<div style='display:flex; justify-content:space-between; align-items:center; font-size:15px; padding-top:4px; border-top:1px dashed rgba(255,255,255,0.1);'>"
                     f"<div style='color:#F5C518;'><span style='font-size:12px; color:#aaa;'>買い目:</span> "
-                    f"<span style='font-weight:900; font-size:17px; letter-spacing:1px;'>{m['pred_str']}</span></div>"
+                    f"<span style='font-weight:900; font-size:15px; letter-spacing:1px;'>{m['pred_str']}</span></div>"
                     f"<div style='text-align:right;'><span style='font-size:12px; color:#aaa;'>結果:</span> "
                     f"<span style='font-weight:bold;'>{m['result_str']}</span></div>"
                     f"</div></div>"
