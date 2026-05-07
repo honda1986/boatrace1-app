@@ -1,618 +1,508 @@
+# -*- coding: utf-8 -*-
 """
-🚤 ボートレース予想アプリ v14.7 (v14.3より緩く + 新データは加点のみ)
-━━━━━━━━━━━━━━━━━━━━━━━━
-データソース: uchisankaku.sakura.ne.jp / boatrace.jp
-
-v14.6 (0件抽出) の反省:
-  ・致命傷2つ以上必須で厳しすぎ
-  ・新規データをゲートに使って、パース失敗時に全件弾かれる
-
-【v14.7 方針】
-  ① v14.3ベースに戻す + 「より緩く」
-     - 1号艇勝率 <5.4 → <5.6
-     - 致命傷 1つ以上 (v14.3と同じ)
-     - モーター致命傷 <30 → <32 (緩和)
-  ② 新データ(コース別ST/1着率/決まり手/体重)は【加点のみ】
-     - ゲートにしない → パース失敗しても0件にならない
-     - 取れた場合のみスコアに反映されて並び順に寄与
-  ③ get_eff_st だけコース別STを優先 (STの精度向上)
+v17.14 全艇スコア解析アプリ（ST改善点の上限2.0設定版）
 """
-import streamlit as st
-import requests
-from bs4 import BeautifulSoup
+
 import re
-from datetime import date, timedelta
-import time
+import concurrent.futures
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
-VENUES = {
-    "01":"桐生","02":"戸田","03":"江戸川","04":"平和島","05":"多摩川",
-    "06":"浜名湖","07":"蒲郡","08":"常滑","09":"津","10":"三国",
-    "11":"びわこ","12":"住之江","13":"尼崎","14":"鳴門","15":"丸亀",
-    "16":"児島","17":"宮島","18":"徳山","19":"下関","20":"若松",
-    "21":"芦屋","22":"福岡","23":"唐津","24":"大村",
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+import lightgbm as lgb
+import numpy as np
+
+# 日本時間の設定
+JST = timezone(timedelta(hours=+9), 'JST')
+
+# ============================================================
+# HTTP設定（超・爆速化のための通信エンジン）
+# ============================================================
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Mobile Safari/537.36"}
+req_session = requests.Session()
+req_session.headers.update(UA)
+
+adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3)
+req_session.mount('https://', adapter)
+req_session.mount('http://', adapter)
+
+BOAT_URL = "https://www.boatrace.jp/owpc/pc/race"
+JCD_NAME = {
+    1:"桐生", 2:"戸田", 3:"江戸川", 4:"平和島", 5:"多摩川", 6:"浜名湖",
+    7:"蒲郡", 8:"常滑", 9:"津", 10:"三国", 11:"びわこ", 12:"住之江",
+    13:"尼崎", 14:"鳴門", 15:"丸亀", 16:"児島", 17:"宮島", 18:"徳山",
+    19:"下関", 20:"若松", 21:"芦屋", 22:"福岡", 23:"唐津", 24:"大村"
 }
-EXCLUDED_VENUES = {"18", "24", "21"}
 
-UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"
-HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"}
-
-COURSE_CSS = {
-    3: "background:#E8212A;color:#FFF;",
-    4: "background:#1B6DB5;color:#FFF;",
+# ============================================================
+# 場別コース別データ
+# ============================================================
+COURSE_WIN_RATE: Dict[str, List[float]] = {
+    "全国":   [55.1, 14.0, 12.8, 11.1, 6.1, 1.8],
+    "桐生":   [53.8, 13.2, 12.6, 12.5, 7.2, 1.4],
+    "戸田":   [43.9, 15.9, 16.6, 14.5, 7.7, 2.5],
+    "江戸川": [45.7, 18.4, 15.1, 12.3, 7.6, 2.6],
+    "平和島": [45.1, 17.0, 14.4, 13.1, 7.7, 3.7],
+    "多摩川": [52.9, 16.5, 12.5, 11.5, 5.9, 1.9],
+    "浜名湖": [50.9, 15.9, 14.4, 11.5, 6.8, 1.6],
+    "蒲郡":   [54.4, 11.8, 13.6, 13.7, 6.2, 1.4],
+    "常滑":   [57.8, 12.8, 10.9, 10.8, 7.0, 1.6],
+    "津":     [57.7, 15.6, 11.9,  9.5, 4.8, 1.4],
+    "三国":   [55.2, 14.9, 13.5, 11.0, 5.3, 1.3],
+    "びわこ": [56.8, 14.6, 11.8, 11.5, 4.6, 1.6],
+    "住之江": [57.9, 14.6, 11.6,  9.8, 5.3, 1.6],
+    "尼崎":   [57.6, 12.0, 12.0, 11.9, 5.6, 1.7],
+    "鳴門":   [47.5, 14.9, 16.1, 12.2, 7.7, 2.3],
+    "丸亀":   [56.2, 15.2, 11.7, 10.3, 5.0, 2.5],
+    "児島":   [55.6, 12.9, 12.1, 12.3, 6.1, 2.0],
+    "宮島":   [57.0, 13.1, 12.9,  9.6, 6.3, 2.0],
+    "徳山":   [65.9, 12.8,  9.2,  6.6, 4.7, 1.1],
+    "下関":   [59.6, 10.6, 10.9, 10.9, 6.2, 2.6],
+    "若松":   [56.8, 11.8, 12.9, 11.2, 6.4, 2.0],
+    "芦屋":   [59.1, 11.3, 11.3, 10.8, 6.1, 2.2],
+    "福岡":   [56.0, 14.8, 15.2,  9.2, 4.8, 1.0],
+    "唐津":   [55.3, 14.2, 13.5, 10.3, 6.6, 1.3],
+    "大村":   [61.3, 12.1, 11.3,  9.6, 5.0, 1.3],
 }
 
-@st.cache_data(ttl=180)
-def fetch(url):
+def venue_course_bonus(v: str, l: int) -> float:
+    if v not in COURSE_WIN_RATE: return 0.0
+    return round((COURSE_WIN_RATE[v][l-1] - COURSE_WIN_RATE["全国"][l-1]) * 0.1, 2)
+
+def venue_attack_bonus(v: str, l: int) -> float:
+    if l < 2 or v not in COURSE_WIN_RATE: return 0.0
+    return round((COURSE_WIN_RATE[v][l-1] - COURSE_WIN_RATE["全国"][l-1]) * 0.05, 2)
+
+# ============================================================
+# データ構造・スコアリング
+# ============================================================
+@dataclass
+class Racer:
+    name: str = ""
+    cls: str = ""
+    win_rate: Optional[float] = None
+    avg_st: Optional[float] = None
+    settle_st: Optional[float] = None
+    settle_avg_rank: Optional[float] = None
+    motor_2rate: Optional[float] = None
+    f_count: int = 0
+    exhibit_rank: Optional[int] = None
+
+def score_boat(r: Racer, venue: str, lane: int) -> Dict[str, float]:
+    parts: Dict[str, float] = {}
+
+    if r.settle_avg_rank and r.settle_avg_rank > 0:
+        parts["節平順"] = round(3.5 / r.settle_avg_rank, 2)
+    else:
+        parts["節平順"] = 0.0
+
+    # ★変更点: ST改善（点）＝ 0.2 ÷ 節平均ST （※最高2.0点まで）
+    if r.settle_st and r.settle_st > 0:
+        raw_st_score = round(0.2 / r.settle_st, 2)
+        parts["節ST改善"] = min(raw_st_score, 2.0)
+    else:
+        parts["節ST改善"] = 0.0
+    
+    exhibit_scores = {1: 1.5, 2: 0.8, 3: 0.3, 4: -0.2, 5: -0.6, 6: -1.0}
+    parts["展示"] = exhibit_scores.get(r.exhibit_rank, 0.0)
+    
+    if r.f_count >= 1: parts["F持ち"] = -1.5 * r.f_count
+    
+    parts["場×コース"] = venue_course_bonus(venue, lane)
+    parts["場×攻め"]   = venue_attack_bonus(venue, lane)
+
+    parts["合計"] = round(sum(parts.values()), 2)
+    return parts
+
+# ============================================================
+# AI予測・ランキング・買い目生成
+# ============================================================
+@st.cache_resource
+def load_lgb_model():
+    try: return lgb.Booster(model_file='lgb_model.txt')
+    except: return None
+
+def get_lgb_features(r: Racer, lane: int, venue: str) -> list:
+    NAME_TO_JCD = {
+        "桐生":1, "戸田":2, "江戸川":3, "平和島":4, "多摩川":5, "浜名湖":6,
+        "蒲郡":7, "常滑":8, "津":9, "三国":10, "びわこ":11, "住之江":12,
+        "尼崎":13, "鳴門":14, "丸亀":15, "児島":16, "宮島":17, "徳山":18,
+        "下関":19, "若松":20, "芦屋":21, "福岡":22, "唐津":23, "大村":24
+    }
+    jcd = NAME_TO_JCD.get(venue, 1)
+    return [float(jcd), float(lane), float(r.win_rate or 0.0), float(r.avg_st or 0.17), float(r.motor_2rate or 0.0)]
+
+def rank_all(racers: List[Racer], venue: str) -> List[Dict]:
+    out = []
+    lgb_model = load_lgb_model()
+    for i, r in enumerate(racers):
+        lane = i + 1
+        bd = score_boat(r, venue, lane)
+        ai_score = 0.0
+        if lgb_model:
+            ai_pred = lgb_model.predict([get_lgb_features(r, lane, venue)])[0]
+            ai_score = round(ai_pred * 10, 2)
+            bd["AI加点"] = ai_score 
+            
+        final_score = round(bd["合計"] + ai_score, 2)
+        bd["総合計(AI込)"] = final_score
+        out.append({"lane": lane, "racer": r, "score": final_score, "breakdown": bd})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+def make_bets(ranked: List[Dict], strategy: str = "standard") -> List[str]:
+    if len(ranked) < 4: return []
+    lanes = [x["lane"] for x in ranked]
+    l1, l2, l3, l4 = lanes[0], lanes[1], lanes[2], lanes[3]
+    l5 = lanes[4] if len(lanes) >= 5 else l4
+    
+    if strategy == "safe": 
+        return [f"{l1}-{l2}-{l3}", f"{l1}-{l3}-{l2}"]
+    elif strategy == "wide": 
+        raw = []
+        for s in (l2, l3, l4):
+            for t in (l2, l3, l4, l5):
+                if t != s and t != l1 and s != l1:
+                    c = f"{l1}-{s}-{t}"
+                    if c not in raw: raw.append(c)
+        return raw
+    else:
+        raw = []
+        for s in (l2, l3):
+            for t in (l2, l3, l4):
+                if t != s and t != l1 and s != l1:
+                    c = f"{l1}-{s}-{t}"
+                    if c not in raw: raw.append(c)
+        return raw
+
+def strategy_label(strategy: str) -> str:
+    return {"safe": "安全2点", "standard": "標準4点", "wide": "拡張9点"}.get(strategy, strategy)
+
+# ============================================================
+# スクレイピング関数群
+# ============================================================
+def get_html(url: str) -> Optional[str]:
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.encoding = "utf-8"
-        return r.text
-    except:
-        return ""
+        r = req_session.get(url, timeout=10)
+        r.encoding = r.apparent_encoding
+        return r.text if r.status_code == 200 else None
+    except: return None
 
-def get_active_venues(ds):
-    hd=ds.replace("-","")
-    try:
-        soup=BeautifulSoup(fetch(f"https://www.boatrace.jp/owpc/pc/race/index?hd={hd}"),"html.parser")
-        seen,out=set(),[]
-        for a in soup.find_all("a",href=True):
-            if "raceindex" in a["href"] and f"hd={hd}" in a["href"]:
-                m=re.search(r"jcd=(\d{2})",a["href"])
-                if m and m.group(1) in VENUES and m.group(1) not in seen:
-                    j=m.group(1); seen.add(j)
-                    out.append({"jcd":j,"name":VENUES[j]})
-        return out
-    except: return []
+@st.cache_data(ttl=600)
+def boatrace_venues(dstr: str) -> List[int]:
+    html = get_html(f"{BOAT_URL}/index?hd={dstr}")
+    if not html: return []
+    return sorted({int(m.group(1)) for m in re.finditer(r'jcd=(\d+)', html)})
 
-def get_race_times(jcd,ds):
-    hd=ds.replace("-",""); times={}
-    try:
-        text=BeautifulSoup(fetch(f"https://www.boatrace.jp/owpc/pc/race/raceindex?jcd={jcd}&hd={hd}"),"html.parser").get_text()
-        v=[]
-        for t in re.findall(r'(\d{1,2}:\d{2})',text):
-            if 8<=int(t.split(":")[0])<=21 and t not in v: v.append(t)
-        for i,t in enumerate(v[:12]): times[i+1]=t
-    except: pass
-    return times
-
-def get_official_result(jcd, ds, rno):
-    hd = ds.replace("-", "")
-    url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={hd}"
-    try:
-        html = fetch(url)
-        if "3連単" not in html: return None
-        soup = BeautifulSoup(html, "html.parser")
-        sanrentan = ""
-        ranks = []
-        payout_val = 0
-        for tr in soup.find_all('tr'):
-            tds = tr.find_all('td')
-            if len(tds) >= 3:
-                header = tds[0].get_text(strip=True)
-                if "3連単" in header:
-                    combo = tds[1].get_text(strip=True) 
-                    payout_str = tds[2].get_text(strip=True) 
-                    sanrentan = f"{combo}  {payout_str}"
-                    if "円" not in sanrentan: sanrentan += "円"
-                    m_combo = re.findall(r'([1-6])', combo)
-                    if len(m_combo) >= 3: ranks = [int(x) for x in m_combo[:3]]
-                    m_payout = re.sub(r'[^\d]', '', payout_str)
-                    if m_payout: payout_val = int(m_payout)
-                    break
-        if sanrentan and ranks: 
-            return {"sanrentan": sanrentan, "ranks": ranks, "payout": payout_val}
-    except: pass
-    return None
-
-@st.cache_data(ttl=120)
-def get_uchi_data(jcd, ds):
-    jcode = str(int(jcd)) 
-    hd = ds.replace("-","")
-    url = f"https://uchisankaku.sakura.ne.jp/racelist.php?jcode={jcode}&date={hd}"
-    return fetch(url)
-
-def _parse_float(s, default=0.0):
-    if s is None: return default
-    s = str(s).replace("%","").replace("F","").replace("(","").replace(")","").replace("kg","").strip()
-    m = re.match(r'^(\d+(?:\.\d+)?)$', s)
-    return float(m.group(1)) if m else default
-
-# ━━━━━━━━━━━ パーサー v14.7 ━━━━━━━━━━━
-
-def parse_uchi_race(html, race_no):
+def fetch_race_detail(jcd: int, rno: int, dstr: str) -> Optional[List[Racer]]:
+    html = get_html(f"{BOAT_URL}/racelist?rno={rno}&jcd={jcd:02d}&hd={dstr}")
+    if not html: return None
     soup = BeautifulSoup(html, "html.parser")
-    target_h3 = None
-    for h3 in soup.find_all("h3"):
-        if re.search(rf'{race_no}R', h3.get_text(strip=True)):
-            target_h3 = h3
+    
+    target = None
+    for tbl in soup.find_all("table"):
+        head = tbl.get_text(" ", strip=True)
+        if all(k in head for k in ["ボートレーサー", "全国", "当地", "モーター"]):
+            target = tbl
             break
-    if not target_h3: return []
-    tbl = target_h3.find_next("table")
-    if not tbl: return []
-    rows = tbl.find_all("tr")
-    
-    # v14.3互換の row_map
-    row_map = {}
-    for tr in rows:
-        cells = tr.find_all(["td","th"])
-        texts = [c.get_text(strip=True) for c in cells]
-        if len(texts) < 7: continue
-        data6 = texts[-6:]
-        label = ""
-        for t in texts[:-6]:
-            t = t.replace("　"," ").strip()
-            if t and t not in ("選手情報","成績","コース別／直近６カ月","決り手","モーター","今節成績","","枠"):
-                label = t
-                break
-        if not label and len(texts) > 7:
-            for t in texts[:3]:
-                t = t.strip()
-                if t and t not in ("","選手情報","成績"):
-                    label = t
-                    break
-        if label: row_map[label] = data6
-    
-    # v14.7 新規: セクション別データ取得 (ベストエフォート、失敗しても OK)
-    section_data = {"course":{}, "kimarite":{}, "motor":{}, "session":{}, "national":{}, "local":{}}
-    current = "info"
-    for tr in rows:
-        cells = tr.find_all(["td","th"])
-        texts = [c.get_text(strip=True) for c in cells]
-        if not texts: continue
-        joined = " ".join(texts)
-        
-        if "全国" in joined and current in ("info","national"):
-            current = "national"
-        elif "当地" in joined:
-            current = "local"
-        elif "コース別" in joined:
-            current = "course"
-        elif ("決り手" in joined) or ("決まり手" in joined):
-            current = "kimarite"
-        elif "今節成績" in joined:
-            current = "session"
-        elif current == "kimarite" and ("モーター" in joined or texts[0].startswith("モ") or "ター" in joined):
-            current = "motor"
-        
-        if len(texts) < 7: continue
-        data6 = texts[-6:]
-        label = ""
-        for t in texts[:-6]:
-            t = t.replace("　"," ").strip()
-            if t and t not in ("選手情報","成績","コース別／直近６カ月","決り手","決まり手","モーター","今節成績","","枠","全国","当地"):
-                label = t
-                break
-        if not label: continue
-        
-        if current in section_data:
-            # Last write wins within section
-            section_data[current][label] = data6
-    
+    if not target: return None
+
     racers = []
-    for i in range(6):
-        r = {"course": i+1}
-        def gv(label):
-            return row_map.get(label, ["","","","","",""])[i].strip() if label in row_map else ""
-        def gs(section, label):
-            d = section_data.get(section, {}).get(label)
-            return d[i].strip() if d else ""
+    rows = target.find_all("tr")
+    lane_map = {"１":1,"２":2,"３":3,"４":4,"５":5,"６":6,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6}
+
+    main_rows = []
+    seen_lanes = set()
+    for tr in rows:
+        a_test = tr.find("a", href=re.compile(r"profile\?toban=\d+"))
+        if not a_test: continue
+        cells = tr.find_all(["td", "th"])
+        if not cells: continue
+        first_text = cells[0].get_text(strip=True)
+        if first_text in lane_map and lane_map[first_text] not in seen_lanes:
+            lane = lane_map[first_text]
+            main_rows.append((lane, tr))
+            seen_lanes.add(lane)
+            if len(main_rows) >= 6: break
+
+    if len(main_rows) < 6: return None
+    main_rows.sort(key=lambda x: x[0])
+
+    all_trs = list(target.find_all("tr"))
+    main_tr_indices = {}
+    for lane, tr in main_rows:
+        try: main_tr_indices[lane] = all_trs.index(tr)
+        except ValueError: pass
+
+    for lane, tr in main_rows:
+        full_text = tr.get_text(" ", strip=True)
+        full_text = re.sub(r"\s+", " ", full_text)
         
-        # 基本情報 (v14.3互換)
-        r["name"] = gv("氏名")
-        r["class"] = gv("級別") or "B1"
-        r["weight"] = _parse_float(gv("体重"), 52.0)
-        
-        f_s = gv("F数").replace("F","")
-        r["f_count"] = int(f_s) if f_s.isdigit() else 0
-        
-        # 全国勝率
-        nat_rate = _parse_float(gs("national","勝率"), 0.0)
-        if nat_rate == 0:
-            # fallback: v14.3式 再ループ
-            in_national = False
-            for tr in rows:
-                cells = tr.find_all(["td","th"])
-                texts2 = [c.get_text(strip=True) for c in cells]
-                joined = " ".join(texts2)
-                if "全国" in joined: in_national = True
-                elif "当地" in joined or "コース別" in joined: in_national = False
-                if len(texts2) >= 7:
-                    data = texts2[-6:]
-                    label2 = " ".join(texts2[:-6]).strip()
-                    if "勝率" in label2:
-                        val = data[i]
-                        if re.match(r'^\d+\.\d+$', val):
-                            if in_national and nat_rate == 0:
-                                nat_rate = float(val)
-            if nat_rate == 0:
-                nr_s = gv("勝率")
-                if re.match(r'^\d+\.\d+$', nr_s): nat_rate = float(nr_s)
-        r["national_rate"] = nat_rate if nat_rate > 0 else 5.0
-        
-        # コース別ST / 1着率 (新規、取れたら使う)
-        r["course_st"] = _parse_float(gs("course","ST"), 0.0)
-        r["course_1st_rate"] = _parse_float(gs("course","1着率"), 0.0)
-        
-        # 決まり手 (新規、取れたら使う)
-        if i == 0:
-            r["defense_weak"] = _parse_float(gs("kimarite","差され"),0.0) + _parse_float(gs("kimarite","捲られ"),0.0)
-            r["attack_rate"] = 0.0
-        else:
-            r["defense_weak"] = 0.0
-            r["attack_rate"] = (
-                _parse_float(gs("kimarite","差し"),0.0)
-                + _parse_float(gs("kimarite","捲り"),0.0)
-                + _parse_float(gs("kimarite","捲り差し"),0.0)
-            )
-        
-        # モーター (v14.3式 fallback込み)
-        in_motor = False
-        motor_2ren = 33.0
-        for tr in rows:
-            cells = tr.find_all(["td","th"])
-            texts2 = [c.get_text(strip=True) for c in cells]
-            joined = " ".join(texts2)
-            if "モーター" in joined or "ター" in joined: in_motor = True
-            elif "今節成績" in joined: in_motor = False
-            if in_motor and len(texts2) >= 7:
-                data = texts2[-6:]
-                label2 = " ".join(texts2[:-6]).strip()
-                if "2連率" in label2:
-                    val = data[i]
-                    if re.match(r'^[\d.]+$', val) and float(val) > 0:
-                        motor_2ren = float(val)
-                        break
-        r["motor_2ren"] = motor_2ren
-        
-        # ST (v14.3式)
-        st_s = gv("ST")
-        r["avg_st"] = float(st_s) if re.match(r'^0\.\d+$', st_s) else 0.15
-        
-        # 今節ST
-        in_session = False
-        session_st = 0.15
-        for tr in rows:
-            cells = tr.find_all(["td","th"])
-            texts2 = [c.get_text(strip=True) for c in cells]
-            joined = " ".join(texts2)
-            if "今節成績" in joined: in_session = True
-            elif in_session and len(texts2) >= 7:
-                data = texts2[-6:]
-                label2 = " ".join(texts2[:-6]).strip()
-                val = data[i]
-                if not val or val == "-": continue
-                if "ST" in label2 and re.match(r'^[\d.]+$', val): 
-                    session_st = float(val)
-        r["session_st"] = session_st
-        
-        racers.append(r)
+        a_tag = tr.find("a", href=re.compile(r"profile\?toban=\d+"))
+        name = a_tag.get_text(strip=True).replace(" ", "").replace("　", "") if a_tag else f"選手{lane}"
+
+        fl_match = re.search(r"F\s*(\d+)\s+L\s*(\d+)", full_text)
+        f_count = int(fl_match.group(1)) if fl_match else 0
+
+        avg_st = 0.17
+        win_rate = 0.0
+        motor_2rate = 0.0
+
+        if fl_match:
+            tail = full_text[fl_match.end():]
+            nums = re.findall(r"-?\d+\.\d+|\d+", tail)
+            try: avg_st = float(nums[0]) if "." in nums[0] else 0.17
+            except: pass
+            try: win_rate = float(nums[1])
+            except: pass
+            try:
+                m2v = float(nums[8])
+                motor_2rate = m2v / 100.0 if m2v > 1.0 else m2v
+            except: pass
+
+        settle_st = None
+        settle_avg_rank = None
+        idx = main_tr_indices.get(lane)
+        if idx is not None and idx + 3 < len(all_trs):
+            st_tr = all_trs[idx + 2]
+            fn_tr = all_trs[idx + 3]
+
+            def cells_text(t): return [td.get_text(strip=True) for td in t.find_all(["td", "th"])]
+
+            st_cells = cells_text(st_tr)
+            fn_cells = cells_text(fn_tr)
+
+            st_vals = []
+            for c in st_cells:
+                if re.search(r"[FLK失]", c): continue
+                if re.fullmatch(r"\.\d+", c):
+                    try: st_vals.append(float("0" + c))
+                    except: pass
+                elif re.fullmatch(r"0\.\d+", c):
+                    try: st_vals.append(float(c))
+                    except: pass
+            if st_vals: settle_st = round(sum(st_vals) / len(st_vals), 3)
+
+            zen_to_han = str.maketrans("１２３４５６", "123456")
+            ranks = []
+            for c in fn_cells:
+                c_norm = c.translate(zen_to_han)
+                if re.fullmatch(r"[1-6]", c_norm): ranks.append(int(c_norm))
+            if ranks: settle_avg_rank = round(sum(ranks) / len(ranks), 2)
+
+        racers.append(Racer(
+            name=name,
+            win_rate=win_rate,
+            avg_st=avg_st,
+            settle_st=settle_st,
+            settle_avg_rank=settle_avg_rank,
+            motor_2rate=motor_2rate,
+            f_count=f_count
+        ))
+
     return racers
 
-# ━━━━━━━━━━━ メイン解析ロジック v14.7 ━━━━━━━━━━━
-
-def get_eff_st(r):
-    """優先度: 今節 > コース別6ヶ月 > 平均 > 0.15"""
-    s = r.get("session_st", 0)
-    if s > 0 and s != 0.15:
-        return s
-    c = r.get("course_st", 0)
-    if c > 0 and c != 0.15:
-        return c
-    return r.get("avg_st", 0.15)
-
-def evaluate_all_patterns(racers, jcd):
-    if jcd in EXCLUDED_VENUES:
-        return None
-    
-    r1, r2, r3, r4, r5, r6 = racers
-    st1, st2, st3, st4, st5, st6 = [get_eff_st(r) for r in racers]
-    nr1, nr2, nr3, nr4, nr5, nr6 = [r.get("national_rate", 5.0) for r in racers]
-    cl1, cl2, cl3, cl4, cl5, cl6 = [r.get("class", "B1") for r in racers]
-    m3 = r3.get("motor_2ren", 33.0)
-    m4 = r4.get("motor_2ren", 33.0)
-    
-    # ━━━ 【絶対条件】v14.3より緩く ━━━
-    c1_weak = (nr1 < 5.6 and cl1 not in ["A1"])  # 5.4→5.6、A1のみ除外 (A2はOK)
-    c2_no_wall = (nr1 > nr2)
-    
-    # ━━━ 致命傷 (1つ以上必須、候補6種類に拡張) ━━━
-    fatal_reasons = []
-    # v14.3既存 (モーター条件は <30→<32 緩和)
-    if r1.get("f_count", 0) >= 1: fatal_reasons.append("1C-F持")
-    if st1 >= 0.17: fatal_reasons.append(f"1C-ST{st1:.2f}")
-    if r1.get("motor_2ren", 33.0) < 32.0: fatal_reasons.append("1C-機力×")
-    # v14.7 新規 (取れたら評価、取れなければスキップ)
-    c1_1st = r1.get("course_1st_rate", 0.0)
-    if 0 < c1_1st < 40.0:
-        fatal_reasons.append(f"1着{c1_1st:.0f}%")
-    def_weak = r1.get("defense_weak", 0.0)
-    if def_weak >= 40.0:
-        fatal_reasons.append(f"被逆{def_weak:.0f}%")
-    w1 = r1.get("weight", 52.0)
-    if w1 >= 56.0:
-        fatal_reasons.append(f"{w1:.0f}kg")
-    
-    if not c1_weak or not c2_no_wall or not fatal_reasons:
-        return None
-    
-    targets = []
-    
-    # ━━━ 3コース一撃まくり (v14.3 + 加点) ━━━
-    if st2 >= st3:
-        c3_strong = (cl3 in ["A1", "A2"] or nr3 >= 6.0)
-        c3_st_ok = (st3 <= 0.15)
-        c3_st_faster = (st3 < st1)
+@st.cache_data(ttl=3600)
+def fetch_result_and_payoff(jcd: int, rno: int, dstr: str) -> Tuple[Dict[int, str], str, int]:
+    html = get_html(f"{BOAT_URL}/raceresult?rno={rno}&jcd={jcd:02d}&hd={dstr}")
+    if not html or "まだ結果がありません" in html or "発売中" in html:
+        return {}, "", 0
         
-        if c3_strong and c3_st_ok and c3_st_faster:
-            score = nr3 + (6.0 - nr1) * 2
-            # v14.7 加点 (取れた場合のみ寄与)
-            c3_1st_rate = r3.get("course_1st_rate", 0.0)
-            c3_attack = r3.get("attack_rate", 0.0)
-            score += c3_1st_rate * 0.05
-            score += c3_attack * 0.08
-            score += max(0, def_weak - 30) * 0.05
-            score += max(0, w1 - 53) * 0.3
-            
-            extra_reasons = []
-            if c3_1st_rate > 0: extra_reasons.append(f"3C1着{c3_1st_rate:.0f}")
-            if c3_attack > 0: extra_reasons.append(f"攻{c3_attack:.0f}")
-            
-            buy_patterns = [
-                [3,4,1], [3,4,5], [3,4,6],
-                [3,5,1], [3,5,4], [3,5,6],
-            ]
-            targets.append({
-                "target": 3,
-                "score": score,
-                "reasons": fatal_reasons + ["2C壁無", "3C強攻"] + extra_reasons,
-                "pred_str": "3-45-1456 (6点)",
-                "buy_patterns": buy_patterns
-            })
+    soup = BeautifulSoup(html, "html.parser")
+    lane_to_rank = {}
     
-    # ━━━ 4コースカド一撃 (v14.3 + 加点) ━━━
-    if nr3 < 5.5:
-        c4_strong = (cl4 in ["A1", "A2"] or nr4 >= 6.0)
-        c4_st_ok = (st4 <= 0.15)
-        c4_inner_slow = (st3 >= st4 + 0.02)
-        c4_st_faster = (st4 < st1)
+    for tbody in soup.select("div.table1 table tbody"):
+        for tr in tbody.find_all("tr"):
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) >= 2:
+                r_str = tds[0].translate(str.maketrans('１２３４５６７８９０', '1234567890'))
+                l_str = tds[1].translate(str.maketrans('１２３４５６７８９０', '1234567890'))
+                if l_str.isdigit() and int(l_str) not in lane_to_rank:
+                    lane_to_rank[int(l_str)] = r_str
+
+    win_combo = ""
+    payoff = 0
+    for tr in soup.find_all("tr"):
+        row_text = tr.get_text(strip=True)
+        if "3連単" in row_text or "３連単" in row_text:
+            cells = tr.find_all("td")
+            if len(cells) >= 2:
+                for td in cells:
+                    txt = td.get_text(strip=True).replace(",", "").replace("¥", "").replace("円", "")
+                    if txt.isdigit():
+                        payoff = int(txt)
+                        break
+            if payoff > 0:
+                break
+                
+    try:
+        r1 = next((k for k, v in lane_to_rank.items() if v == "1"), None)
+        r2 = next((k for k, v in lane_to_rank.items() if v == "2"), None)
+        r3 = next((k for k, v in lane_to_rank.items() if v == "3"), None)
+        if r1 and r2 and r3:
+            win_combo = f"{r1}-{r2}-{r3}"
+    except:
+        pass
         
-        if c4_strong and c4_st_ok and c4_inner_slow and c4_st_faster:
-            score = nr4 + (6.0 - nr1) * 2
-            c4_1st_rate = r4.get("course_1st_rate", 0.0)
-            c4_attack = r4.get("attack_rate", 0.0)
-            score += c4_1st_rate * 0.05
-            score += c4_attack * 0.08
-            score += max(0, def_weak - 30) * 0.05
-            score += max(0, w1 - 53) * 0.3
+    return lane_to_rank, win_combo, payoff
+
+# ============================================================
+# メインUI
+# ============================================================
+st.set_page_config(page_title="v17.14 超・爆速解析", layout="wide")
+st.title("🚤 v17.14 全艇スコア解析")
+st.caption("AI一本化 ＆ フルデータ開示 ＆ 超・爆速15並列エンジン搭載")
+
+tab1, tab2 = st.tabs(["🔍 1レース解析", "📊 バックテスト"])
+
+# ----------------------------------------------------
+# タブ1: 1レース解析
+# ----------------------------------------------------
+with tab1:
+    st.subheader("🔍 1レース解析")
+    col1, col2 = st.columns(2)
+    with col1:
+        d_input = st.date_input("日付", value=datetime.now(JST).date())
+    with col2:
+        v_idx = st.selectbox("場", options=list(JCD_NAME.keys()), format_func=lambda x: JCD_NAME[x])
+        
+    r_idx = st.selectbox("レース", options=list(range(1, 13)))
+    
+    if st.button("🔍 解析開始", type="primary", use_container_width=True):
+        dstr = d_input.strftime("%Y%m%d")
+        racers = fetch_race_detail(v_idx, r_idx, dstr)
+        if racers:
+            venue_name = JCD_NAME[v_idx]
+            ranked = rank_all(racers, venue_name)
             
-            extra_reasons = []
-            if c4_1st_rate > 0: extra_reasons.append(f"4C1着{c4_1st_rate:.0f}")
-            if c4_attack > 0: extra_reasons.append(f"攻{c4_attack:.0f}")
+            st.success("解析完了！")
             
-            buy_patterns = [[4,5,1], [4,5,6], [4,1,5], [4,1,6], [4,6,1], [4,6,5]]
-            targets.append({
-                "target": 4,
-                "score": score,
-                "reasons": fatal_reasons + ["内枠総崩", "4C先行"] + extra_reasons,
-                "pred_str": "4-156-156 (6点)",
-                "buy_patterns": buy_patterns
-            })
-    
-    if not targets: return None
-    
-    best = max(targets, key=lambda x: x["score"])
-    stars = "★★★" if best["score"] >= 9.0 else "★★☆" if best["score"] >= 7.0 else "★☆☆"
-    
-    return {
-        "target": best["target"],
-        "score": round(best["score"], 1),
-        "stars": stars,
-        "reasons": best["reasons"],
-        "st_info": f"1C({st1:.2f}) 2C({st2:.2f}) 3C({st3:.2f}) 4C({st4:.2f}) 5C({st5:.2f})",
-        "pw_info": f"1C({nr1:.1f}{cl1}) 2C({nr2:.1f}{cl2}) 3C({nr3:.1f}{cl3}) 4C({nr4:.1f}{cl4}) 5C({nr5:.1f}{cl5})",
-        "pred_str": best["pred_str"],
-        "buy_patterns": best["buy_patterns"]
-    }
-
-def daterange(start_date, end_date):
-    for n in range(int((end_date - start_date).days) + 1):
-        yield start_date + timedelta(n)
-
-# ━━━━━━━━━━━ UI ━━━━━━━━━━━
-def main():
-    st.set_page_config(page_title="🚤 確殺ハイエナ v14.7",page_icon="🔥",layout="wide",initial_sidebar_state="collapsed")
-    st.markdown("""<style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
-    .stApp{background:linear-gradient(135deg,#0a0a1a,#0d1b2a 40%,#1b2838);font-family:'Noto Sans JP',sans-serif}
-    .hdr{background:linear-gradient(90deg,#E8212A,#B71C1C);padding:16px 24px;border-radius:12px;display:flex;align-items:center;gap:14px;box-shadow:0 4px 20px rgba(232,33,42,0.35);margin-bottom:16px}
-    .hdr h1{color:#FFF!important;font-size:22px!important;font-weight:900!important;letter-spacing:3px;margin:0!important;padding:0!important}
-    .hdr .sub{color:#ffcdd2;font-size:11px;letter-spacing:1px}
-    .card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:16px;margin-bottom:12px}
-    .sl{font-size:12px;font-weight:700;color:#E8212A;letter-spacing:2px;margin-bottom:8px}
-    </style>""",unsafe_allow_html=True)
-    
-    st.markdown('<div class="hdr"><span style="font-size:32px">🔥</span><div><h1>BOAT RACE AI</h1><div class="sub">v14.7 ─ v14.3より緩く + 新データは加点のみ</div></div></div>',unsafe_allow_html=True)
-
-    st.markdown('<div class="card"><div class="sl">STEP 1 ─ 対象期間（最大31日）</div>',unsafe_allow_html=True)
-    sel_dates = st.date_input("対象期間", value=(date.today(), date.today()), label_visibility="collapsed")
-    
-    if isinstance(sel_dates, tuple):
-        if len(sel_dates) == 2:
-            s_date, e_date = sel_dates
-        elif len(sel_dates) == 1:
-            s_date = e_date = sel_dates[0]
+            df_disp = []
+            for item in ranked:
+                racer = item["racer"]
+                bd = item["breakdown"]
+                
+                df_disp.append({
+                    "予想順": len(df_disp) + 1,
+                    "枠": item["lane"],
+                    "選手名": racer.name,
+                    "総合スコア": item["score"],
+                    
+                    "AI加点": bd.get("AI加点", 0.0),
+                    
+                    "勝率": round(racer.win_rate, 2) if racer.win_rate else 0.0,
+                    "平均ST": round(racer.avg_st, 2) if racer.avg_st else 0.0,
+                    "モーター": round(racer.motor_2rate, 2) if racer.motor_2rate else 0.0,
+                    "節平均順位": round(racer.settle_avg_rank, 2) if racer.settle_avg_rank else "-",
+                    "節平均ST": round(racer.settle_st, 2) if racer.settle_st else "-",
+                    "F数": racer.f_count,
+                    
+                    "節平順(点)": bd.get("節平順", 0.0),
+                    "ST改善(点)": bd.get("節ST改善", 0.0),
+                    "F持ち(点)": bd.get("F持ち", 0.0),
+                    "場×コース(点)": bd.get("場×コース", 0.0),
+                    "場×攻め(点)": bd.get("場×攻め", 0.0)
+                })
+            
+            st.dataframe(pd.DataFrame(df_disp), use_container_width=True)
+            
+            st.subheader("💡 おすすめ買い目")
+            bets_safe = make_bets(ranked, "safe")
+            bets_std = make_bets(ranked, "standard")
+            bets_wide = make_bets(ranked, "wide")
+            st.write(f"**安全2点**: {', '.join(bets_safe) if bets_safe else 'なし'}")
+            st.write(f"**標準4点**: {', '.join(bets_std) if bets_std else 'なし'}")
+            st.write(f"**拡張9点**: {', '.join(bets_wide) if bets_wide else 'なし'}")
         else:
-            s_date = e_date = date.today()
-    else:
-        s_date = e_date = sel_dates
-        
-    st.markdown('</div>',unsafe_allow_html=True)
+            st.error("出走表が取得できませんでした。")
 
-    if st.button(f"🎯 指定期間をまとめて解析（確殺ハイエナ v14.7）", type="primary", use_container_width=True):
-        date_list = list(daterange(s_date, e_date))
-        total_days = len(date_list)
+# ----------------------------------------------------
+# タブ2: バックテスト（超・爆速版）
+# ----------------------------------------------------
+with tab2:
+    st.subheader("📊 期間バックテスト（超・爆速仕様）")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        bt_start = st.date_input("開始日 ", value=datetime.now(JST).date() - timedelta(days=2))
+    with col2:
+        bt_end = st.date_input("終了日 ", value=datetime.now(JST).date() - timedelta(days=1))
         
-        if total_days > 31:
-            st.error("⚠️ 検索期間が長すぎます。サーバー負荷を防ぐため、31日以内で指定してください。")
-            return
+    bt_venue_idx = st.selectbox("場を指定", options=[0] + list(JCD_NAME.keys()), format_func=lambda x: "全国（すべて）" if x==0 else JCD_NAME[x])
+    bt_strategy = st.radio("買い目戦略", options=["safe", "standard", "wide"], format_func=strategy_label, horizontal=True)
 
-        with st.spinner(f"対象期間（計{total_days}日分）のレースを解析中..."):
-            matches = []
-            invested = 0
-            returned = 0
-            finished_count = 0
+    if st.button("📊 バックテスト実行", type="primary", use_container_width=True):
+        days = [(bt_start + timedelta(days=i)).strftime("%Y%m%d") for i in range((bt_end - bt_start).days + 1)]
+        matches = []
+        prog = st.progress(0.0)
+        
+        tasks = []
+        for dstr in days:
+            jcds = boatrace_venues(dstr)
+            if bt_venue_idx != 0:
+                jcds = [bt_venue_idx] if bt_venue_idx in jcds else []
+            for j in jcds:
+                for r in range(1, 13):
+                    tasks.append((dstr, j, r))
+                    
+        st.write(f"全 {len(tasks)} レースを15並列で一気に解析中...")
+        
+        def analyze_race(d, j, r):
+            racers = fetch_race_detail(j, r, d)
+            if not racers: return None
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for i, current_date in enumerate(date_list):
-                ds = current_date.strftime("%Y-%m-%d")
-                status_text.text(f"🔍 解析中: {ds} ({i+1}/{total_days}日目)")
-                
-                venues = get_active_venues(ds)
-                if not venues:
-                    progress_bar.progress((i + 1) / total_days)
-                    continue
-
-                for v in venues:
-                    jcd = v["jcd"]
-                    html = get_uchi_data(jcd, ds)
-                    if not html: continue
-                    rtimes = get_race_times(jcd, ds)
-
-                    for rno in range(1, 13):
-                        racers = parse_uchi_race(html, rno)
-                        if len(racers) < 6: continue
-
-                        ev = evaluate_all_patterns(racers, jcd)
-                        if not ev: continue
-                        
-                        race_info = {
-                            "date": ds,
-                            "jcd": jcd, "name": v["name"], "rno": rno,
-                            "time": rtimes.get(rno, "--:--"),
-                            "target": ev["target"],
-                            "pred_str": ev["pred_str"],
-                            "buy_patterns": ev["buy_patterns"],
-                            "st_info": ev["st_info"],
-                            "pw_info": ev["pw_info"],
-                            "score": ev["score"],
-                            "stars": ev["stars"],
-                            "reasons": ev["reasons"],
-                            "is_finished": False,
-                            "hit": False,
-                            "result_str": "未確定",
-                            "payout": 0,
-                        }
-
-                        res = get_official_result(jcd, ds, rno)
-                        if res and res.get("ranks"):
-                            race_info["is_finished"] = True
-                            race_info["result_str"] = res["sanrentan"]
-                            finished_count += 1
-                            invested += len(race_info["buy_patterns"]) * 100
-
-                            if res["ranks"] in race_info["buy_patterns"]:
-                                race_info["hit"] = True
-                                race_info["payout"] = res["payout"]
-                                race_info["result_str"] = f"🎯 {res['sanrentan']}"
-                                returned += res["payout"]
-
-                        matches.append(race_info)
-                        
-                progress_bar.progress((i + 1) / total_days)
-                
-            status_text.text(f"✅ 解析完了（計{total_days}日分）")
-            time.sleep(1)
-            status_text.empty()
-            progress_bar.empty()
-
-            matches.sort(key=lambda x: x["score"], reverse=True)
-
-            st.session_state["search_matches"] = matches
-            st.session_state["search_invested"] = invested
-            st.session_state["search_returned"] = returned
-            st.session_state["search_finished"] = finished_count
-            st.session_state["search_done"] = True
-
-    if st.session_state.get("search_done"):
-        matches = st.session_state.get("search_matches", [])
-        inv = st.session_state.get("search_invested", 0)
-        ret = st.session_state.get("search_returned", 0)
-        fin = st.session_state.get("search_finished", 0)
-        roi = (ret / inv * 100) if inv > 0 else 0
-        
-        hit_count = sum(1 for m in matches if m["hit"])
-        hit_rate = (hit_count / fin * 100) if fin > 0 else 0
-        avg_payout = (ret / hit_count) if hit_count > 0 else 0
-
-        st.markdown('<div style="background:rgba(232, 33, 42, 0.1); padding:16px; border-radius:12px; border:1px solid #E8212A; margin-bottom:16px;">', unsafe_allow_html=True)
-        date_range_str = f"{s_date.strftime('%m/%d')} 〜 {e_date.strftime('%m/%d')}" if s_date != e_date else f"{s_date.strftime('%m/%d')}"
-        st.markdown(f"<h3 style='margin-bottom:4px;'>🎯 ハイエナ予想一覧 ({date_range_str}): 計 {len(matches)} 件</h3>", unsafe_allow_html=True)
-        
-        roi_color = "#2D8C3C" if roi >= 100 else "#F5C518" if roi >= 80 else "#E8212A"
-        hit_color = "#2D8C3C" if hit_rate >= 20 else "#F5C518" if hit_rate >= 15 else "#E8212A"
-
-        dash_html = (
-            f"<div style='display:flex; justify-content:space-around; background:rgba(0,0,0,0.3); padding:16px; border-radius:8px; margin-top:12px; margin-bottom:20px; border:1px solid rgba(255,255,255,0.1); flex-wrap:wrap; gap:8px;'>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>終了</span><br><span style='font-size:20px;font-weight:bold;'>{fin}<span style='font-size:13px;'>件</span></span></div>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>的中</span><br><span style='font-size:20px;font-weight:bold;color:{hit_color};'>{hit_count}<span style='font-size:13px;'>件 ({hit_rate:.1f}%)</span></span></div>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>平均配当</span><br><span style='font-size:20px;font-weight:bold;color:#F5C518;'>{int(avg_payout):,}<span style='font-size:13px;'>円</span></span></div>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>投資</span><br><span style='font-size:20px;font-weight:bold;'>{inv:,}<span style='font-size:13px;'>円</span></span></div>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>払戻</span><br><span style='font-size:20px;font-weight:bold;color:{roi_color};'>{ret:,}<span style='font-size:13px;'>円</span></span></div>"
-            f"<div style='text-align:center;'><span style='font-size:12px;color:#aaa;'>回収率</span><br><span style='font-size:22px;font-weight:900;color:{roi_color};'>{roi:.1f}<span style='font-size:15px;'>%</span></span></div>"
-            f"</div>"
-        )
-        st.markdown(dash_html, unsafe_allow_html=True)
-
+            ranks, actual_result, payoff = fetch_result_and_payoff(j, r, d)
+            if not actual_result: return None 
+            
+            venue_name = JCD_NAME.get(j, "不明")
+            ranked = rank_all(racers, venue_name)
+            bets = make_bets(ranked, strategy=bt_strategy)
+            
+            hit = actual_result in bets
+            top_score = ranked[0]["score"]
+            ai_score = ranked[0]["breakdown"].get("AI加点", 0.0)
+            
+            return {
+                "日付": d,
+                "場": venue_name,
+                "R": r,
+                "買い目": ", ".join(bets),
+                "点数": len(bets),
+                "結果": actual_result,
+                "的中": "🎯" if hit else "❌",
+                "払戻金": payoff, 
+                "獲得金": payoff if hit else 0, 
+                "スコア": top_score,
+                "AI加点": ai_score
+            }
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            future_to_task = {executor.submit(analyze_race, d, j, r): (d, j, r) for d, j, r in tasks}
+            done_count = 0
+            for future in concurrent.futures.as_completed(future_to_task):
+                done_count += 1
+                prog.progress(done_count / len(tasks) if len(tasks) > 0 else 1.0)
+                res = future.result()
+                if res:
+                    matches.append(res)
+                    
         if matches:
-            for m in matches:
-                bg_color = "rgba(45, 140, 60, 0.2)" if m["hit"] else "rgba(255,255,255,0.03)"
-                border_s = "border:1px solid #2D8C3C;" if m["hit"] else "border:1px solid rgba(255,255,255,0.1);"
-                hit_badge = "<span style='background:#2D8C3C; color:#fff; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:bold;'>的中🎯</span>" if m["hit"] else ""
-                miss_1c = ""
-                if m["is_finished"] and not m["hit"]:
-                    miss_1c = "<span style='background:#E8212A; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px;'>不的中</span>"
-
-                sc_color = "#F5C518" if m["score"] >= 9.0 else "#E8212A"
-
-                reason_tags = " ".join(
-                    f"<span style='background:rgba(255,255,255,0.08);padding:1px 6px;border-radius:3px;font-size:11px;color:#ccc;margin-right:4px;'>{r}</span>"
-                    for r in m["reasons"]
-                )
-
-                tgt = m["target"]
-                badge_css = COURSE_CSS.get(tgt, "background:#999;color:#fff;")
-                tgt_badge = f"<span style='{badge_css} padding:3px 8px; border-radius:4px; font-weight:bold; font-size:13px; margin-right:8px;'>{tgt}アタマ</span>"
-                
-                race_date_str = m['date'][5:].replace("-", "/")
-
-                card_html = (
-                    f"<div style='background:{bg_color}; padding:12px 16px; border-radius:8px; {border_s} margin-bottom:10px;'>"
-                    f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>"
-                    f"<div>{tgt_badge}<span style='color:#E8212A;font-weight:bold;font-size:16px;'>[{race_date_str}] {m['name']} {m['rno']}R</span>"
-                    f"<span style='color:#ccc; font-size:13px; margin-left:8px;'>🕒 {m['time']}</span></div>"
-                    f"<div style='display:flex;align-items:center;gap:8px;'>"
-                    f"<span style='color:{sc_color};font-weight:900;font-size:18px;'>{m['stars']}</span>"
-                    f"{hit_badge}{miss_1c}</div></div>"
-                    f"<div style='font-size:11px; color:#888; margin-bottom:2px;'>ST : {m['st_info']}</div>"
-                    f"<div style='font-size:11px; color:#888; margin-bottom:4px;'>勝率: {m['pw_info']}</div>"
-                    f"<div style='margin-bottom:6px;'>{reason_tags}</div>"
-                    f"<div style='display:flex; justify-content:space-between; align-items:center; font-size:15px; padding-top:4px; border-top:1px dashed rgba(255,255,255,0.1);'>"
-                    f"<div style='color:#F5C518;'><span style='font-size:12px; color:#aaa;'>買い目:</span> "
-                    f"<span style='font-weight:900; font-size:17px; letter-spacing:1px;'>{m['pred_str']}</span></div>"
-                    f"<div style='text-align:right;'><span style='font-size:12px; color:#aaa;'>結果:</span> "
-                    f"<span style='font-weight:bold;'>{m['result_str']}</span></div>"
-                    f"</div></div>"
-                )
-                st.markdown(card_html, unsafe_allow_html=True)
+            df_bt = pd.DataFrame(matches)
+            hits = df_bt[df_bt["的中"] == "🎯"]
+            
+            total_invest = df_bt["点数"].sum() * 100
+            total_return = df_bt["獲得金"].sum()
+            hit_rate = len(hits) / len(df_bt) * 100 if len(df_bt) > 0 else 0
+            ret_rate = total_return / total_invest * 100 if total_invest > 0 else 0
+            
+            st.success(f"解析完了！ 対象レース: {len(df_bt)}件 / 的中: {len(hits)}件 (的中率 {hit_rate:.1f}%)")
+            st.info(f"💰 **総投資**: {total_invest:,}円 / **総回収**: {total_return:,}円 (回収率: {ret_rate:.1f}%)")
+            
+            disp_cols = ["日付", "場", "R", "買い目", "結果", "的中", "払戻金", "スコア", "AI加点"]
+            st.dataframe(df_bt[disp_cols], use_container_width=True)
         else:
-            st.warning("指定された期間に条件に合致するレースはありませんでした。")
-
-        if st.button("✖ 検索結果を閉じる", key="close_search"):
-            st.session_state["search_done"] = False
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-if __name__=="__main__":
-    main()
+            st.warning("解析できるレースがありませんでした（中止または発売前）。")
